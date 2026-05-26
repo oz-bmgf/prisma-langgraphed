@@ -98,9 +98,8 @@ def test_slr_graph_has_expected_nodes():
     from src.graph.agents.slr_graph import slr_graph
     nodes = set(slr_graph.nodes.keys())
     expected = {
-        "slr_start",
-        "slr_expand_queries",
-        "slr_fetch_source",
+        "slr_agent",
+        "slr_tools",
         "slr_collect_papers",
         "slr_synthesise",
         "slr_finalise",
@@ -113,11 +112,9 @@ def test_lbd_graph_has_expected_nodes():
     from src.graph.agents.lbd_graph import lbd_graph
     nodes = set(lbd_graph.nodes.keys())
     expected = {
-        "lbd_start",
-        "lbd_broad_search",
-        "lbd_extract_concepts",
-        "lbd_fetch_concept_papers",
-        "lbd_collect_concept_papers",
+        "lbd_agent",
+        "lbd_tools",
+        "lbd_collect_papers",
         "lbd_discover_connections",
         "lbd_synthesise",
         "lbd_finalise",

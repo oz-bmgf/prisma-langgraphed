@@ -109,47 +109,38 @@ def test_causal_join_nodes():
         f"collect_science_results not a source of necessity_check: {nc_sources}"
 
 
-def test_slr_graph_has_parallel_expand_node():
+def test_slr_graph_has_agent_tool_loop():
+    """SLR uses an agent + ToolNode loop (Option B: LLM-driven tool selection)."""
     from src.graph.agents.slr_graph import slr_graph
     nodes = list(slr_graph.nodes.keys())
-    assert "slr_expand_queries" in nodes, \
-        f"slr_expand_queries not in nodes: {nodes}"
-    assert "slr_start" in nodes, \
-        f"slr_start not in nodes: {nodes}"
+    assert "slr_agent" in nodes, f"slr_agent not in nodes: {nodes}"
+    assert "slr_tools" in nodes, f"slr_tools not in nodes: {nodes}"
 
     drawable = slr_graph.get_graph()
     edges = [(e.source, e.target) for e in drawable.edges]
-    slr_start_targets = [t for s, t in edges if s == "slr_start"]
-    assert "slr_expand_queries" in slr_start_targets, \
-        f"slr_expand_queries not a target of slr_start: {slr_start_targets}"
-    # slr_expand_queries should join at slr_collect_papers
-    eq_targets = [t for s, t in edges if s == "slr_expand_queries"]
-    assert "slr_collect_papers" in eq_targets, \
-        f"slr_collect_papers not a target of slr_expand_queries: {eq_targets}"
+    # slr_tools must feed back into slr_agent (the loop)
+    tools_targets = [t for s, t in edges if s == "slr_tools"]
+    assert "slr_agent" in tools_targets, \
+        f"slr_tools → slr_agent edge missing: {tools_targets}"
 
 
-def test_lbd_graph_has_parallel_broad_search():
+def test_lbd_graph_has_agent_tool_loop():
+    """LBD uses an agent + ToolNode loop (Option B: LLM-driven tool selection)."""
     from src.graph.agents.lbd_graph import lbd_graph
     nodes = list(lbd_graph.nodes.keys())
-    assert "lbd_broad_search" in nodes, \
-        f"lbd_broad_search not in nodes: {nodes}"
-    assert "lbd_start" in nodes, \
-        f"lbd_start not in nodes: {nodes}"
+    assert "lbd_agent" in nodes, f"lbd_agent not in nodes: {nodes}"
+    assert "lbd_tools" in nodes, f"lbd_tools not in nodes: {nodes}"
 
     drawable = lbd_graph.get_graph()
     edges = [(e.source, e.target) for e in drawable.edges]
-    lbd_start_targets = [t for s, t in edges if s == "lbd_start"]
-    assert "lbd_broad_search" in lbd_start_targets, \
-        f"lbd_broad_search not a target of lbd_start: {lbd_start_targets}"
-    assert "lbd_extract_concepts" in lbd_start_targets, \
-        f"lbd_extract_concepts not a target of lbd_start: {lbd_start_targets}"
-
-    # Both branches should join at lbd_discover_connections
-    disc_sources = [s for s, t in edges if t == "lbd_discover_connections"]
-    assert "lbd_broad_search" in disc_sources, \
-        f"lbd_broad_search not a source of lbd_discover_connections: {disc_sources}"
-    assert "lbd_collect_concept_papers" in disc_sources, \
-        f"lbd_collect_concept_papers not a source of lbd_discover_connections: {disc_sources}"
+    # lbd_tools must feed back into lbd_agent (the loop)
+    tools_targets = [t for s, t in edges if s == "lbd_tools"]
+    assert "lbd_agent" in tools_targets, \
+        f"lbd_tools → lbd_agent edge missing: {tools_targets}"
+    # lbd_collect_papers must flow into lbd_discover_connections
+    collect_targets = [t for s, t in edges if s == "lbd_collect_papers"]
+    assert "lbd_discover_connections" in collect_targets, \
+        f"lbd_collect_papers → lbd_discover_connections edge missing: {collect_targets}"
 
 
 @pytest.mark.asyncio

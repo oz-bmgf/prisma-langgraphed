@@ -3,6 +3,9 @@ from __future__ import annotations
 import operator
 from typing import Annotated, Optional, TypedDict
 
+from langchain_core.messages import AnyMessage
+from langgraph.graph.message import add_messages
+
 
 def merge_scope_outputs(existing: list[dict] | None, update: list[dict] | None) -> list[dict]:
     """
@@ -50,8 +53,8 @@ class SLRAgentState(TypedDict):
     query: str
     context: str
     top_k: int
-    openalex_results: Annotated[list[dict], operator.add]
-    asta_results: Annotated[list[dict], operator.add]
+    messages: Annotated[list[AnyMessage], add_messages]
+    agent_rounds: int
     merged_papers: Optional[list[dict]]          # written once by slr_collect_papers
     synthesis: Optional[str]
     source_count: int
@@ -61,17 +64,16 @@ class SLRAgentState(TypedDict):
     success: bool
     error_message: Optional[str]
     errors: Annotated[list[str], operator.add]
-    expanded_queries: Optional[list[str]]
 
 
 class LBDAgentState(TypedDict):
     task_id: str
     query: str
     context: str
-    seed_concepts: Optional[list[str]]
-    concept_papers: Annotated[list[dict], operator.add]
-    broad_search_results: Optional[list[dict]]
-    merged_papers: Optional[list[dict]]          # written once by lbd_discover_connections
+    messages: Annotated[list[AnyMessage], add_messages]
+    agent_rounds: int
+    seed_concepts: Optional[list[str]]           # extracted from tool call args in lbd_collect_papers
+    merged_papers: Optional[list[dict]]          # written once by lbd_collect_papers
     discovered_concepts: Optional[list[dict]]
     narrative: Optional[str]
     paper_count: int
@@ -110,20 +112,6 @@ class EdisonAgentState(TypedDict):
     success: bool
     error_message: Optional[str]
     errors: Annotated[list[str], operator.add]
-
-
-class SLRFetchState(TypedDict):
-    source: str
-    query: str
-    top_k: int
-    result: Optional[list[dict]]
-
-
-class LBDConceptFetchState(TypedDict):
-    concept: str
-    query: str
-    top_k: int
-    result: Optional[list[dict]]
 
 
 class DeepWebSearchRoundState(TypedDict):

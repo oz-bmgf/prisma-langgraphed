@@ -1,22 +1,24 @@
 """Tests for src/graph/subgraphs/lbd.py — canonical LBD subgraph location."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from langgraph.types import Send
+from langchain_core.messages import AIMessage, ToolMessage
 
 from src.graph.subgraphs.lbd import (
     _parse_concepts,
-    lbd_collect_concept_papers,
-    lbd_dispatch_concepts,
+    _parse_papers_from_content,
+    _route_lbd,
+    lbd_agent,
+    lbd_collect_papers,
     lbd_discover_connections,
-    lbd_fetch_concept_papers,
     lbd_finalise,
     lbd_graph,
     lbd_synthesise,
 )
-from src.graph.state import LBDAgentState, LBDConceptFetchState
+from src.graph.state import LBDAgentState
 
 
 # ---------------------------------------------------------------------------
@@ -29,9 +31,9 @@ def _state(**overrides) -> dict:
         "task_id": "L1",
         "query": "malaria iron deficiency anemia connection",
         "context": "",
+        "messages": [],
+        "agent_rounds": 0,
         "seed_concepts": None,
-        "concept_papers": [],
-        "broad_search_results": None,
         "merged_papers": None,
         "discovered_concepts": None,
         "narrative": None,
@@ -53,109 +55,262 @@ _PAPERS = [
 
 
 # ---------------------------------------------------------------------------
-# test_lbd_dispatch_skips_completed
-# Task spec: fan-out uses seed_concepts; worker returns early when result pre-set
+# _parse_concepts
 # ---------------------------------------------------------------------------
 
 
-async def test_lbd_dispatch_sends_per_concept():
-    """lbd_dispatch_concepts emits one Send per seed concept."""
-    state = _state(seed_concepts=["malaria", "anemia", "iron"])
-    result = await lbd_dispatch_concepts(state)
-    assert isinstance(result, list)
-    assert len(result) == 3
-    assert all(s.node == "lbd_fetch_concept_papers" for s in result)
-    concepts_sent = {s.arg["concept"] for s in result}
-    assert concepts_sent == {"malaria", "anemia", "iron"}
+def test_parse_concepts_from_list():
+    result = _parse_concepts('["malaria", "iron deficiency", "anemia"]')
+    assert "malaria" in result
+    assert "anemia" in result
 
 
-async def test_lbd_dispatch_falls_back_to_query_when_no_concepts():
-    """lbd_dispatch_concepts uses original query when seed_concepts is None."""
-    state = _state(seed_concepts=None)
-    result = await lbd_dispatch_concepts(state)
-    assert isinstance(result, list)
-    assert len(result) == 1
-    assert result[0].arg["concept"] == state["query"]
-
-
-async def test_lbd_dispatch_caps_at_max_concepts():
-    """lbd_dispatch_concepts caps at _MAX_CONCEPTS_FOR_FETCH (5)."""
-    state = _state(seed_concepts=["a", "b", "c", "d", "e", "f", "g"])
-    result = await lbd_dispatch_concepts(state)
-    assert isinstance(result, list)
-    assert len(result) == 5
+def test_parse_concepts_from_csv():
+    result = _parse_concepts("malaria, iron deficiency, anemia, immune response")
+    assert len(result) >= 3
 
 
 # ---------------------------------------------------------------------------
-# test_lbd_worker_pure
-# Task spec: worker returns plain dict, no side effects
+# _route_lbd
 # ---------------------------------------------------------------------------
 
 
-async def test_lbd_worker_pure_returns_concept_papers():
-    """lbd_fetch_concept_papers returns concept_papers and trace, no file I/O."""
-    fake_papers = [{"title": "Paper A", "abstract": "abc", "year": 2020}]
-    worker_state: LBDConceptFetchState = {
-        "concept": "malaria",
-        "query": "malaria iron link",
-        "top_k": 10,
-        "result": None,
-    }
-    with patch("src.graph.subgraphs.lbd.search_asta") as mock_tool:
-        mock_tool.ainvoke = AsyncMock(return_value=fake_papers)
-        result = await lbd_fetch_concept_papers(worker_state, {})
-
-    assert isinstance(result, dict)
-    assert "concept_papers" in result
-    assert result["concept_papers"] == fake_papers
-    assert result["tool_traces"][0]["success"] is True
-    assert result["tool_traces"][0]["concept"] == "malaria"
+def test_route_lbd_empty_messages():
+    assert _route_lbd(_state()) == "lbd_collect_papers"
 
 
-async def test_lbd_worker_error_surfaces_to_errors_field():
-    """lbd_fetch_concept_papers network failure goes into errors[], not raises."""
-    worker_state: LBDConceptFetchState = {
-        "concept": "anemia",
-        "query": "malaria iron link",
-        "top_k": 10,
-        "result": None,
-    }
-    with patch("src.graph.subgraphs.lbd.search_asta") as mock_tool:
-        mock_tool.ainvoke = AsyncMock(side_effect=RuntimeError("network timeout"))
-        result = await lbd_fetch_concept_papers(worker_state, {})
-
-    assert "errors" in result
-    assert any("anemia" in e for e in result["errors"])
-    assert result["tool_traces"][0]["success"] is False
+def test_route_lbd_has_tool_calls():
+    ai_msg = AIMessage(content="", tool_calls=[
+        {"name": "search_asta", "args": {"query": "malaria", "top_k": 15}, "id": "1"},
+    ])
+    assert _route_lbd(_state(messages=[ai_msg], agent_rounds=1)) == "lbd_tools"
 
 
-async def test_lbd_worker_skips_when_result_pre_populated():
-    """lbd_fetch_concept_papers returns early when result already set (idempotency)."""
-    prepopulated = [{"title": "Cached paper"}]
-    worker_state: LBDConceptFetchState = {
-        "concept": "malaria",
-        "query": "malaria iron link",
-        "top_k": 10,
-        "result": prepopulated,
-    }
-    result = await lbd_fetch_concept_papers(worker_state, {})
-    assert result == {"concept_papers": prepopulated}
+def test_route_lbd_no_tool_calls():
+    ai_msg = AIMessage(content="Searches complete.")
+    assert _route_lbd(_state(messages=[ai_msg], agent_rounds=1)) == "lbd_collect_papers"
+
+
+def test_route_lbd_max_rounds():
+    ai_msg = AIMessage(content="", tool_calls=[{"name": "search_asta", "args": {}, "id": "1"}])
+    assert _route_lbd(_state(messages=[ai_msg], agent_rounds=3)) == "lbd_collect_papers"
 
 
 # ---------------------------------------------------------------------------
-# test_lbd_graph_has_all_nodes
+# lbd_collect_papers — extracts papers + concepts from messages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lbd_collect_papers_extracts_papers():
+    msgs = [
+        ToolMessage(content=json.dumps(_PAPERS[:1]), tool_call_id="1", name="search_asta"),
+        ToolMessage(content=json.dumps(_PAPERS[1:]), tool_call_id="2", name="search_asta"),
+    ]
+    result = await lbd_collect_papers(_state(messages=msgs), {})
+    assert result["paper_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_lbd_collect_papers_deduplicates():
+    paper = {"title": "Shared"}
+    msgs = [
+        ToolMessage(content=json.dumps([paper, {"title": "A"}]), tool_call_id="1", name="search_asta"),
+        ToolMessage(content=json.dumps([paper, {"title": "B"}]), tool_call_id="2", name="search_asta"),
+    ]
+    result = await lbd_collect_papers(_state(messages=msgs), {})
+    assert result["paper_count"] == 3  # "Shared" deduped
+
+
+@pytest.mark.asyncio
+async def test_lbd_collect_papers_extracts_concepts():
+    ai_msg = AIMessage(
+        content="",
+        tool_calls=[
+            {"name": "search_asta", "args": {"query": "malaria", "top_k": 15}, "id": "1"},
+            {"name": "search_asta", "args": {"query": "iron deficiency", "top_k": 15}, "id": "2"},
+            # broad search = main query; should not appear as concept
+            {"name": "search_asta", "args": {"query": "malaria iron deficiency anemia connection", "top_k": 15}, "id": "3"},
+        ],
+    )
+    msgs = [
+        ai_msg,
+        ToolMessage(content=json.dumps([{"title": "A"}]), tool_call_id="1", name="search_asta"),
+        ToolMessage(content=json.dumps([{"title": "B"}]), tool_call_id="2", name="search_asta"),
+        ToolMessage(content=json.dumps([]), tool_call_id="3", name="search_asta"),
+    ]
+    result = await lbd_collect_papers(_state(messages=msgs), {})
+    assert "malaria" in result["seed_concepts"]
+    assert "iron deficiency" in result["seed_concepts"]
+    assert "malaria iron deficiency anemia connection" not in result["seed_concepts"]
+
+
+@pytest.mark.asyncio
+async def test_lbd_collect_papers_fallback_concept():
+    msgs = [ToolMessage(content=json.dumps([{"title": "A"}]), tool_call_id="1", name="search_asta")]
+    result = await lbd_collect_papers(_state(messages=msgs), {})
+    assert result["seed_concepts"] == ["malaria iron deficiency anemia connection"]
+
+
+# ---------------------------------------------------------------------------
+# lbd_discover_connections — reads merged_papers, extracts B-terms
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lbd_discover_connections_empty_merged_papers():
+    result = await lbd_discover_connections(_state(merged_papers=[]), {})
+    assert result["discovered_concepts"] == []
+
+
+@pytest.mark.asyncio
+async def test_lbd_discover_connections_extracts_b_terms():
+    state = _state(merged_papers=_PAPERS)
+    with patch("src.graph.subgraphs.lbd.acall_llm", new=AsyncMock(return_value='["bridge_concept"]')):
+        result = await lbd_discover_connections(state, {})
+    assert result["discovered_concepts"] == [{"term": "bridge_concept", "type": "bridge"}]
+    # merged_papers is NOT returned since it's already in state
+    assert "merged_papers" not in result
+
+
+@pytest.mark.asyncio
+async def test_lbd_discover_connections_skips_when_already_done():
+    state = _state(discovered_concepts=[{"term": "x", "type": "bridge"}])
+    result = await lbd_discover_connections(state, {})
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_lbd_discover_connections_surfaces_llm_error():
+    state = _state(merged_papers=_PAPERS)
+    with patch("src.graph.subgraphs.lbd.acall_llm", new=AsyncMock(side_effect=RuntimeError("LLM down"))):
+        result = await lbd_discover_connections(state, {})
+    assert result["discovered_concepts"] == []
+    assert any("lbd_discover_connections" in e for e in result.get("errors", []))
+
+
+@pytest.mark.asyncio
+async def test_lbd_discover_connections_passes_config_to_acall_llm():
+    captured: list[dict] = []
+
+    async def _mock_acall(*args, config=None, **kwargs):
+        captured.append({"config": config})
+        return '["bridge_concept"]'
+
+    state = _state(merged_papers=_PAPERS)
+    with patch("src.graph.subgraphs.lbd.acall_llm", side_effect=_mock_acall):
+        await lbd_discover_connections(state, {"configurable": {"research_model": "test-model"}})
+
+    assert len(captured) == 1
+    assert captured[0]["config"] is not None
+
+
+# ---------------------------------------------------------------------------
+# lbd_synthesise
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lbd_synthesise_skips_when_already_done():
+    result = await lbd_synthesise(_state(narrative="Existing narrative."), {})
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_lbd_synthesise_llm_failure_surfaces_error():
+    state = _state(merged_papers=_PAPERS)
+    with patch("src.graph.subgraphs.lbd.acall_llm", new=AsyncMock(side_effect=RuntimeError("LLM down"))):
+        result = await lbd_synthesise(state, {})
+    assert result["narrative"] is None
+    assert any("lbd_synthesise" in e for e in result.get("errors", []))
+
+
+# ---------------------------------------------------------------------------
+# lbd_finalise
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lbd_finalise_success():
+    state = _state(
+        merged_papers=_PAPERS,
+        narrative="Found indirect connections.",
+        seed_concepts=["malaria", "anemia"],
+        discovered_concepts=[{"term": "iron", "type": "bridge"}],
+    )
+    result = await lbd_finalise(state, {})
+    assert result["result"]["success"] is True
+    assert result["result"]["thesis"] == "Found indirect connections."
+    assert "malaria" in result["result"]["concepts"]
+    assert result["result"]["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_lbd_finalise_adds_status_field():
+    state = _state(merged_papers=_PAPERS, narrative="connections found", errors=[])
+    result = await lbd_finalise(state, {})
+    assert result["result"]["status"] == "ok"
+
+    state_err = _state(errors=["lbd_agent: timeout"])
+    result_err = await lbd_finalise(state_err, {})
+    assert result_err["result"]["status"] == "error"
+
+
+@pytest.mark.asyncio
+async def test_lbd_finalise_reads_merged_papers():
+    state = _state(
+        merged_papers=_PAPERS,
+        narrative="connections found",
+    )
+    result = await lbd_finalise(state, {})
+    assert result["result"]["papers"] == _PAPERS
+    assert result["result"]["paper_count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# lbd_agent — round limit guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lbd_agent_respects_max_rounds():
+    state = _state(agent_rounds=3)
+    result = await lbd_agent(state, {})
+    assert result == {}
+
+
+@pytest.mark.asyncio
+async def test_lbd_agent_injects_initial_messages():
+    final_response = AIMessage(content="", tool_calls=[
+        {"name": "search_asta", "args": {"query": "malaria", "top_k": 15}, "id": "tc1"},
+    ])
+    mock_llm = MagicMock()
+    mock_bound = MagicMock()
+    mock_bound.ainvoke = AsyncMock(return_value=final_response)
+
+    with (
+        patch("src.graph.subgraphs.lbd._build_llm", return_value=mock_llm),
+        patch.object(mock_llm, "bind_tools", return_value=mock_bound),
+    ):
+        result = await lbd_agent(_state(), {})
+
+    assert "messages" in result
+    assert result["agent_rounds"] == 1
+    # First call: SystemMessage + HumanMessage + AIMessage
+    assert len(result["messages"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# Graph topology
 # ---------------------------------------------------------------------------
 
 
 def test_lbd_graph_has_all_nodes():
-    """Compiled graph nodes match topology declared in module docstring."""
     graph_nodes = set(lbd_graph.get_graph().nodes.keys()) - {"__start__", "__end__"}
     expected = {
-        "lbd_start",
-        "lbd_broad_search",
-        "lbd_extract_concepts",
-        "lbd_fetch_concept_papers",
-        "lbd_collect_concept_papers",
+        "lbd_agent",
+        "lbd_tools",
+        "lbd_collect_papers",
         "lbd_discover_connections",
         "lbd_synthesise",
         "lbd_finalise",
@@ -165,119 +320,3 @@ def test_lbd_graph_has_all_nodes():
 
 def test_lbd_graph_compiles():
     assert lbd_graph is not None
-
-
-# ---------------------------------------------------------------------------
-# test_lbd_handles_empty_results
-# Task spec: discover_connections and synthesise handle empty merged_papers gracefully
-# ---------------------------------------------------------------------------
-
-
-async def test_lbd_discover_connections_returns_empty_when_no_papers():
-    """lbd_discover_connections sets merged_papers=[] and discovered_concepts=[] gracefully."""
-    state = _state(concept_papers=[], broad_search_results=[])
-    result = await lbd_discover_connections(state, {})
-    assert result["merged_papers"] == []
-    assert result["discovered_concepts"] == []
-
-
-async def test_lbd_discover_connections_writes_merged_papers():
-    """lbd_discover_connections deduplicates concept_papers + broad_search_results once."""
-    paper_a = {"title": "Paper A", "abstract": "abc"}
-    paper_b = {"title": "Paper B", "abstract": "def"}
-    paper_b_dup = {"title": "Paper B", "abstract": "def (dup)"}
-    state = _state(
-        concept_papers=[paper_a, paper_b],
-        broad_search_results=[paper_b_dup],
-    )
-    with patch("src.graph.subgraphs.lbd.acall_llm", new=AsyncMock(return_value='["bridge_concept"]')):
-        result = await lbd_discover_connections(state, {})
-
-    assert "merged_papers" in result
-    titles = [p["title"] for p in result["merged_papers"]]
-    assert titles.count("Paper B") == 1
-    assert len(result["merged_papers"]) == 2
-
-
-async def test_lbd_synthesise_skips_when_already_done():
-    """lbd_synthesise returns {} when narrative already set (idempotency)."""
-    state = _state(narrative="Existing narrative.")
-    result = await lbd_synthesise(state, {})
-    assert result == {}
-
-
-async def test_lbd_synthesise_llm_failure_surfaces_error():
-    """lbd_synthesise LLM exception surfaces to errors field, narrative=None."""
-    state = _state(merged_papers=_PAPERS)
-    with patch("src.graph.subgraphs.lbd.acall_llm", new=AsyncMock(side_effect=RuntimeError("LLM down"))):
-        result = await lbd_synthesise(state, {})
-    assert result["narrative"] is None
-    assert any("lbd_synthesise" in e for e in result.get("errors", []))
-
-
-async def test_lbd_finalise_adds_status_field():
-    """lbd_finalise adds status: ok/error for finalize.py enrichment gate."""
-    state = _state(merged_papers=_PAPERS, narrative="connections found", errors=[])
-    result = await lbd_finalise(state, {})
-    assert result["result"]["status"] == "ok"
-
-    state_err = _state(errors=["lbd_fetch_x: timeout"])
-    result_err = await lbd_finalise(state_err, {})
-    assert result_err["result"]["status"] == "error"
-
-
-async def test_lbd_finalise_reads_merged_papers():
-    """lbd_finalise uses merged_papers (not raw concept_papers) for papers list."""
-    state = _state(
-        merged_papers=_PAPERS,
-        concept_papers=[{"title": "Stale"}],
-        narrative="connections found",
-    )
-    result = await lbd_finalise(state, {})
-    assert result["result"]["papers"] == _PAPERS
-    assert result["result"]["paper_count"] == 2
-
-
-# ---------------------------------------------------------------------------
-# config threading
-# ---------------------------------------------------------------------------
-
-
-async def test_lbd_discover_connections_passes_config_to_acall_llm():
-    """acall_llm must receive config= so LLM calls appear as child spans."""
-    captured: list[dict] = []
-
-    async def _mock_acall(*args, config=None, **kwargs):
-        captured.append({"config": config})
-        return '["bridge_concept"]'
-
-    state = _state(concept_papers=_PAPERS, broad_search_results=[])
-    with patch("src.graph.subgraphs.lbd.acall_llm", side_effect=_mock_acall):
-        await lbd_discover_connections(state, {"configurable": {"research_model": "test-model"}})
-
-    assert len(captured) == 1
-    assert captured[0]["config"] is not None
-
-
-# ---------------------------------------------------------------------------
-# Full dry-run through compiled graph
-# ---------------------------------------------------------------------------
-
-
-async def test_lbd_graph_dry_run():
-    """End-to-end dry run through compiled lbd_graph with mocked I/O."""
-    fake_papers = [
-        {"title": "Study A", "abstract": "malaria and iron link", "year": 2020},
-        {"title": "Study B", "abstract": "anemia and nets", "year": 2021},
-    ]
-    with (
-        patch("src.graph.subgraphs.lbd.search_asta") as mock_asta,
-        patch("src.graph.subgraphs.lbd.acall_llm", new=AsyncMock(return_value='["malaria", "anemia"]')),
-    ):
-        mock_asta.ainvoke = AsyncMock(return_value=fake_papers)
-        final = await lbd_graph.ainvoke(_state())
-
-    assert final["result"] is not None
-    assert final["result"]["success"] is True
-    assert final["merged_papers"] is not None
-    assert len(final["merged_papers"]) > 0

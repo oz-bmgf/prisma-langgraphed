@@ -1,230 +1,181 @@
-"""SLR (Systematic Literature Review) subgraph — 6 nodes.
+"""SLR (Systematic Literature Review) subgraph — agent + ToolNode loop.
 
-# Step 1 — Audit findings vs src/graph/agents/slr_graph.py
-# ──────────────────────────────────────────────────────────────────────────────
-# | Pattern found                                   | File:line          | Fix applied                                          |
-# |-------------------------------------------------|--------------------|------------------------------------------------------|
-# | Missing config=config on acall_llm              | slr_graph.py:74-81 | config threaded through slr_expand_queries           |
-# | Missing config=config on acall_llm              | slr_graph.py:213   | config threaded through slr_synthesise               |
-# | except Exception: queries=[] — silent discard   | slr_graph.py:88-89 | errors surfaced into state "errors" field            |
-# | Redundant dedup in both collect and synthesise  | slr_graph.py:155,  | slr_collect_papers writes merged_papers; synthesise  |
-# |                                                 | 191-197            | reads it directly (no re-dedup)                      |
-# | slr_finalise re-concatenates raw source lists   | slr_graph.py:233   | reads merged_papers from state (already deduped)     |
-# | slr_plan_sources always emits 2 Sends — no      | slr_graph.py:34-49 | checks openalex_results / asta_results in state;     |
-# | idempotency on LangGraph checkpoint resume      |                    | skips already-fetched sources                        |
-# | Implementation in graph/agents/ not subgraphs/  | slr_graph.py       | moved to src/graph/subgraphs/slr.py                  |
-# ──────────────────────────────────────────────────────────────────────────────
-
-# SLR Subgraph topology:
+# SLR Subgraph topology (Option B: LLM-driven tool selection):
 #
 #   START
 #     │
 #     ▼
-#   slr_start ───────────────────────────────────────────────────────┐
-#     │ [unconditional edge]                [conditional edge via     │
-#     │                                      slr_plan_sources]        │
-#     ▼                                                              ▼
-#   slr_expand_queries                        slr_fetch_source (×0-2: openalex, asta)
-#     │                                                              │
-#     └──────────────────────────┬───────────────────────────────────┘
-#                                │  all active branches join here
-#                                ▼
-#                       slr_collect_papers  ←── dedup; writes merged_papers, source_count,
-#                                │               search_strategy to state
-#                                ▼
-#                       slr_synthesise      ←── LLM over merged_papers; uses expanded_queries
-#                                │
-#                                ▼
-#                       slr_finalise        ←── assembles result dict from state
-#                                │
-#                                ▼
-#                               END
+#   slr_agent ─── [has tool_calls?] ──► slr_tools ──► slr_agent (loop, max _MAX_ROUNDS)
+#     │
+#     │ [no tool_calls or rounds exhausted]
+#     ▼
+#   slr_collect_papers  ◄── extracts papers from ToolMessages in state.messages;
+#     │                      deduplicates; writes merged_papers, search_strategy,
+#     │                      source_count to state
+#     ▼
+#   slr_synthesise      ◄── LLM over merged_papers
+#     │
+#     ▼
+#   slr_finalise        ◄── assembles result dict from state
+#     │
+#     ▼
+#    END
 #
-# Idempotency: slr_plan_sources checks openalex_results / asta_results in state
-# and skips already-fetched sources (enables clean resume from LangGraph checkpoints).
-# slr_expand_queries and slr_synthesise each check their output field and return {}
-# if already populated.
+# The LLM in slr_agent is bound to [search_openalex, search_asta] and prompted
+# to call both tools with the primary query and 1-2 alternative phrasings.
+# ToolNode executes all tool calls concurrently (LangGraph fan-out within the node).
+# Tool call spans appear as proper entries in LangSmith / Langfuse traces.
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
-import re
-import time
-from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal
 
+from langchain_core.messages import AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
+from langgraph.prebuilt import ToolNode
 
-from src.config import DEFAULT_RESEARCH_MODEL, OPENALEX_MAX_RESULTS
-from src.core.llm_utils import acall_llm
+from src.config import DEFAULT_RESEARCH_MODEL, DEFAULT_MAX_TOKENS
+from src.core.llm_utils import _build_llm, acall_llm
 from src.graph.agents.tools.search_tools import search_asta, search_openalex
-from src.graph.state import SLRAgentState, SLRFetchState
+from src.graph.state import SLRAgentState
 
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Node: slr_start — trivial entry enabling parallel fan-out from one hub
-# ---------------------------------------------------------------------------
-
-
-async def slr_start(state: SLRAgentState, config: RunnableConfig) -> dict:
-    """Trivial entry node — hub that fans out to slr_expand_queries and
-    slr_plan_sources simultaneously from a single source node."""
-    return {}
+_MAX_ROUNDS = 3   # safety cap — normally exits after 1-2 rounds
 
 
 # ---------------------------------------------------------------------------
-# Conditional edge: slr_plan_sources — idempotent router, returns list[Send]
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-async def slr_plan_sources(state: SLRAgentState) -> list[Send] | str:
-    """Fan-out router: emit one Send per source that hasn't been fetched yet.
+def _parse_papers_from_content(content: str) -> list[dict]:
+    """Parse a ToolMessage content string into a list of paper dicts."""
+    if not content:
+        return []
+    try:
+        result = json.loads(content)
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, ValueError):
+        pass
+    try:
+        result = ast.literal_eval(content)
+        return result if isinstance(result, list) else []
+    except Exception:
+        return []
 
-    Idempotency: checks openalex_results and asta_results in state. Non-empty
-    means the source was already fetched on a previous run — skip it.
-    Falls through to slr_collect_papers when all sources are already done.
+
+# ---------------------------------------------------------------------------
+# Node: slr_agent — LLM with bound tools
+# ---------------------------------------------------------------------------
+
+
+async def slr_agent(state: SLRAgentState, config: RunnableConfig) -> dict:
+    """LLM agent node: calls search_openalex and search_asta via tool use.
+
+    On the first call the system + user messages are injected. Subsequent
+    calls continue the conversation with the tool results already in state.
+    Max _MAX_ROUNDS calls total; returns {} to force exit if exceeded.
     """
-    sends: list[Send] = []
-
-    if not state.get("openalex_results"):
-        sends.append(Send("slr_fetch_source", SLRFetchState(
-            source="openalex",
-            query=state["query"],
-            top_k=state.get("top_k") or OPENALEX_MAX_RESULTS,
-            result=None,
-        )))
-
-    if not state.get("asta_results"):
-        sends.append(Send("slr_fetch_source", SLRFetchState(
-            source="asta",
-            query=state["query"],
-            top_k=state.get("top_k") or OPENALEX_MAX_RESULTS,
-            result=None,
-        )))
-
-    return sends or "slr_collect_papers"
-
-
-# ---------------------------------------------------------------------------
-# Node: slr_expand_queries — LLM query expansion, runs parallel with fetch
-# ---------------------------------------------------------------------------
-
-
-async def slr_expand_queries(state: SLRAgentState, config: RunnableConfig) -> dict:
-    """LLM generates 2-3 alternative query phrasings for better recall.
-    Runs in parallel with the slr_fetch_source fan-out.
-    Results stored in expanded_queries and picked up by slr_synthesise.
-    """
-    if state.get("expanded_queries") is not None:
+    rounds = state.get("agent_rounds") or 0
+    if rounds >= _MAX_ROUNDS:
         return {}
 
-    from src.prompts.research_prompts import (
-        SLR_QUERY_EXPANSION_SYSTEM,
-        SLR_QUERY_EXPANSION_USER,
-    )
+    existing_messages: list[AnyMessage] = list(state.get("messages") or [])
+    first_call = not existing_messages
 
-    model = (config.get("configurable") or {}).get("research_model", DEFAULT_RESEARCH_MODEL)
-    try:
-        raw = await acall_llm(
-            SLR_QUERY_EXPANSION_USER.format(
+    if first_call:
+        from src.prompts.research_prompts import SLR_AGENT_SYSTEM, SLR_AGENT_USER
+        existing_messages = [
+            SystemMessage(content=SLR_AGENT_SYSTEM),
+            HumanMessage(content=SLR_AGENT_USER.format(
                 query=state["query"],
                 context=state.get("context") or "",
-            ),
-            SLR_QUERY_EXPANSION_SYSTEM,
-            model=model,
-            config=config,
-        )
-        m = re.search(r'\{.*\}', raw, re.DOTALL)
-        queries: list[str] = json.loads(m.group()).get("queries", []) if m else []
-    except Exception as exc:
-        logger.warning("slr_expand_queries failed: %s", exc)
-        queries = []
-        return {
-            "expanded_queries": queries,
-            "errors": [f"slr_expand_queries: {exc}"],
-        }
+            )),
+        ]
 
-    return {"expanded_queries": queries[:3]}
-
-
-# ---------------------------------------------------------------------------
-# Node: slr_fetch_source — worker, HTTP only, no LLM
-# ---------------------------------------------------------------------------
-
-
-async def slr_fetch_source(state: SLRFetchState, config: RunnableConfig) -> dict:
-    """Worker: fetch papers from one source. HTTP only, no LLM.
-    Returns to the openalex_results or asta_results reducer field.
-    """
-    if state.get("result") is not None:
-        field = "openalex_results" if state["source"] == "openalex" else "asta_results"
-        return {field: state["result"]}
-
-    start = time.monotonic()
-    called_at = datetime.now(timezone.utc).isoformat()
-    source = state["source"]
-
+    model_name = (config.get("configurable") or {}).get("research_model", DEFAULT_RESEARCH_MODEL)
     try:
-        if source == "openalex":
-            papers = await search_openalex.ainvoke({"query": state["query"], "top_k": state["top_k"]})
-            field = "openalex_results"
-        else:
-            papers = await search_asta.ainvoke({"query": state["query"], "top_k": state["top_k"]})
-            field = "asta_results"
-
-        duration_ms = int((time.monotonic() - start) * 1000)
-        trace = {
-            "tool_name": f"search_{source}",
-            "called_at": called_at,
-            "duration_ms": duration_ms,
-            "success": True,
-            "result_count": len(papers) if papers else 0,
-        }
-        return {field: papers or [], "tool_traces": [trace]}
-
+        llm = _build_llm(model_name, max_tokens=1024).bind_tools(
+            [search_openalex, search_asta]
+        )
+        response = await llm.ainvoke(existing_messages, config=config)
     except Exception as exc:
-        duration_ms = int((time.monotonic() - start) * 1000)
-        return {
-            "errors": [f"slr_fetch_{source}: {exc}"],
-            "tool_traces": [{
-                "tool_name": f"search_{source}",
-                "called_at": called_at,
-                "duration_ms": duration_ms,
-                "success": False,
-                "error_message": str(exc),
-            }],
-        }
+        logger.error("slr_agent LLM call failed: %s", exc)
+        return {"errors": [f"slr_agent: {exc}"]}
+
+    new_messages: list[AnyMessage] = (
+        existing_messages + [response] if first_call else [response]
+    )
+    return {"messages": new_messages, "agent_rounds": rounds + 1}
 
 
 # ---------------------------------------------------------------------------
-# Node: slr_collect_papers — deduplicate once; write merged_papers to state
+# Routing: _route_slr — decides tool loop vs. collect
+# ---------------------------------------------------------------------------
+
+
+def _route_slr(state: SLRAgentState) -> Literal["slr_tools", "slr_collect_papers"]:
+    """Route to slr_tools if the last message has pending tool calls, else collect."""
+    messages: list[AnyMessage] = state.get("messages") or []
+    if not messages:
+        return "slr_collect_papers"
+    last = messages[-1]
+    rounds = state.get("agent_rounds") or 0
+    if rounds >= _MAX_ROUNDS:
+        return "slr_collect_papers"
+    if hasattr(last, "tool_calls") and last.tool_calls:
+        return "slr_tools"
+    return "slr_collect_papers"
+
+
+# ---------------------------------------------------------------------------
+# ToolNode: slr_tools — executes tool calls from the last AIMessage
+# ---------------------------------------------------------------------------
+
+slr_tools = ToolNode([search_openalex, search_asta])
+
+
+# ---------------------------------------------------------------------------
+# Node: slr_collect_papers — extract and deduplicate papers from ToolMessages
 # ---------------------------------------------------------------------------
 
 
 async def slr_collect_papers(state: SLRAgentState, config: RunnableConfig) -> dict:
-    """Merge and deduplicate results from both sources into merged_papers.
+    """Extract papers from ToolMessages in state.messages and deduplicate.
 
-    This is the single deduplication point. slr_synthesise and slr_finalise
-    both read merged_papers directly — no second deduplication pass.
+    ToolNode stores tool results in ToolMessage.content. Each message has a
+    .name attribute matching the tool ("search_openalex" / "search_asta").
+    Deduplicates by lowercased title; writes merged_papers, search_strategy,
+    and source_count to state.
     """
-    oa = state.get("openalex_results") or []
-    asta_r = state.get("asta_results") or []
+    openalex_papers: list[dict] = []
+    asta_papers: list[dict] = []
+
+    for msg in (state.get("messages") or []):
+        if not isinstance(msg, ToolMessage):
+            continue
+        papers = _parse_papers_from_content(msg.content)
+        tool_name = getattr(msg, "name", "") or ""
+        if tool_name == "search_openalex":
+            openalex_papers.extend(papers)
+        elif tool_name == "search_asta":
+            asta_papers.extend(papers)
 
     seen: set[str] = set()
     merged: list[dict] = []
-    for paper in oa + asta_r:
+    for paper in openalex_papers + asta_papers:
         key = (paper.get("title") or "").lower().strip()
         if key and key not in seen:
             seen.add(key)
             merged.append(paper)
 
-    has_oa = bool(oa)
-    has_asta = bool(asta_r)
+    has_oa = bool(openalex_papers)
+    has_asta = bool(asta_papers)
     strategy = (
         "combined" if has_oa and has_asta
         else "openalex" if has_oa
@@ -246,7 +197,6 @@ async def slr_collect_papers(state: SLRAgentState, config: RunnableConfig) -> di
 
 async def slr_synthesise(state: SLRAgentState, config: RunnableConfig) -> dict:
     """LLM: synthesise evidence from merged_papers.
-    Uses expanded_queries as additional context when available.
     Reads merged_papers written by slr_collect_papers — no re-deduplication.
     """
     if state.get("synthesis") is not None:
@@ -264,15 +214,10 @@ async def slr_synthesise(state: SLRAgentState, config: RunnableConfig) -> dict:
         for i, p in enumerate(papers[:20], 1)
     )
 
-    expanded = state.get("expanded_queries") or []
-    query_context = state["query"]
-    if expanded:
-        query_context = f"{state['query']}\n\nRelated phrasings: {'; '.join(expanded)}"
-
     model = (config.get("configurable") or {}).get("research_model", DEFAULT_RESEARCH_MODEL)
     try:
         synthesis = await acall_llm(
-            SLR_SYNTHESIS_TEMPLATE.format(query=query_context, papers=papers_text),
+            SLR_SYNTHESIS_TEMPLATE.format(query=state["query"], papers=papers_text),
             SLR_SYNTHESIS_SYSTEM,
             model=model,
             max_tokens=2048,
@@ -318,32 +263,22 @@ async def slr_finalise(state: SLRAgentState, config: RunnableConfig) -> dict:
 def build_slr_graph() -> StateGraph:
     builder = StateGraph(SLRAgentState)
 
-    builder.add_node("slr_start", slr_start)
-    builder.add_node("slr_expand_queries", slr_expand_queries)
-    # slr_plan_sources is a conditional edge function, not a node
-    builder.add_node("slr_fetch_source", slr_fetch_source)
+    builder.add_node("slr_agent", slr_agent)
+    builder.add_node("slr_tools", slr_tools)
     builder.add_node("slr_collect_papers", slr_collect_papers)
     builder.add_node("slr_synthesise", slr_synthesise)
     builder.add_node("slr_finalise", slr_finalise)
 
-    # ── Parallel branches from slr_start ─────────────────────────────────────
-    # Branch 1: LLM query expansion (unconditional edge)
-    # Branch 2: source fetch fan-out (conditional edge via slr_plan_sources × 0-2)
-    builder.add_edge(START, "slr_start")
-    builder.add_edge("slr_start", "slr_expand_queries")
+    builder.add_edge(START, "slr_agent")
     builder.add_conditional_edges(
-        "slr_start",
-        slr_plan_sources,
+        "slr_agent",
+        _route_slr,
         {
-            "slr_fetch_source": "slr_fetch_source",
+            "slr_tools": "slr_tools",
             "slr_collect_papers": "slr_collect_papers",
         },
     )
-
-    # ── Join at slr_collect_papers ────────────────────────────────────────────
-    builder.add_edge("slr_expand_queries", "slr_collect_papers")
-    builder.add_edge("slr_fetch_source", "slr_collect_papers")
-
+    builder.add_edge("slr_tools", "slr_agent")
     builder.add_edge("slr_collect_papers", "slr_synthesise")
     builder.add_edge("slr_synthesise", "slr_finalise")
     builder.add_edge("slr_finalise", END)

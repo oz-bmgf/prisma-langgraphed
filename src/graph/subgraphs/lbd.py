@@ -1,146 +1,77 @@
-"""LBD (Literature-Based Discovery) subgraph — 7 nodes.
+"""LBD (Literature-Based Discovery) subgraph — agent + ToolNode loop.
 
-# Step 1 — Audit findings vs src/graph/agents/lbd_graph.py
-# ──────────────────────────────────────────────────────────────────────────────
-# | Pattern found                                     | File:line             | Fix applied                                             |
-# |---------------------------------------------------|-----------------------|---------------------------------------------------------|
-# | Missing config=config on acall_llm                | lbd_graph.py:72       | config threaded in lbd_extract_concepts                 |
-# | Missing config=config on acall_llm                | lbd_graph.py:230      | config threaded in lbd_discover_connections             |
-# | Missing config=config on acall_llm                | lbd_graph.py:276      | config threaded in lbd_synthesise                       |
-# | Silent except in lbd_extract_concepts             | lbd_graph.py:78-81    | error surfaced to state "errors" field (fallback kept)  |
-# | Silent except in lbd_discover_connections         | lbd_graph.py:233-234  | error surfaced to state "errors" field                  |
-# | lbd_synthesise except: sets narrative to error    | lbd_graph.py:287-289  | narrative=None; error surfaced to "errors" field        |
-# | Redundant dedup in lbd_discover_connections       | lbd_graph.py:211-217  | single dedup at join node; writes merged_papers         |
-# | Redundant dedup in lbd_synthesise                 | lbd_graph.py:257-263  | reads merged_papers directly (no re-dedup)              |
-# | lbd_finalise reads raw concept_papers accumulator | lbd_graph.py:302      | reads merged_papers instead                             |
-# | Missing status field in finalise result           | lbd_graph.py:306-315  | status: "ok"/"error" added for finalize.py gate         |
-# | Implementation in graph/agents/, not subgraphs/   | lbd_graph.py          | moved to src/graph/subgraphs/lbd.py                     |
-# ──────────────────────────────────────────────────────────────────────────────
-
-# LBD Subgraph topology:
+# LBD Subgraph topology (Option B: LLM-driven tool selection):
 #
 #   START
 #     │
 #     ▼
-#   lbd_start ──[branch 1: unconditional]──────────────────────────────────────────────┐
-#     │                                                                                  │
-#     │ [branch 2: unconditional]                                                        ▼
-#     ▼                                                                         lbd_broad_search
-#   lbd_extract_concepts                                                                 │
-#     │                                                                                  │
-#     │ [conditional via lbd_dispatch_concepts]                                          │
-#     │   Send("lbd_fetch_concept_papers", LBDConceptFetchState) × N concepts           │
-#     ▼                                                                                  │
-#   lbd_fetch_concept_papers (×N, parallel)                                              │
-#     │                                                                                  │
-#     ▼                                                                                  │
-#   lbd_collect_concept_papers  ◄──────────────────────────────────────────────────────┘
-#     │                                   (all branches join here via LangGraph fan-in)
+#   lbd_agent ─── [has tool_calls?] ──► lbd_tools ──► lbd_agent (loop, max _MAX_ROUNDS)
+#     │
+#     │ [no tool_calls or rounds exhausted]
+#     ▼
+#   lbd_collect_papers  ◄── extracts all search_asta ToolMessages from state.messages;
+#     │                      deduplicates; writes merged_papers and seed_concepts to state
+#     ▼
+#   lbd_discover_connections ◄── LLM B-term extraction from merged_papers (Swanson ABC)
 #     │
 #     ▼
-#   lbd_discover_connections ← single dedup: writes merged_papers; LLM extracts B-terms
+#   lbd_synthesise      ◄── LLM narrative over merged_papers + seed_concepts + B-terms
 #     │
 #     ▼
-#   lbd_synthesise            ← LLM narrative over merged_papers (no re-dedup)
-#     │
-#     ▼
-#   lbd_finalise              ← assembles result dict from state
+#   lbd_finalise        ◄── assembles result dict from state
 #     │
 #     ▼
 #    END
 #
-# lbd_dispatch_concepts is a conditional edge routing function (not a node):
-# fans out one Send() per seed concept.
-# lbd_discover_connections is the join node where lbd_collect_concept_papers
-# (concept fetch chain) AND lbd_broad_search (broad ASTA search) both converge.
-# At join time, both concept_papers and broad_search_results are in state —
-# merged_papers is written here (single dedup point).
+# The LLM in lbd_agent is bound to [search_asta] and prompted to identify 3-5
+# key concepts from the query, then call search_asta for each concept and once
+# more for the full query. ToolNode executes all calls concurrently.
+# Tool call spans appear as proper entries in LangSmith / Langfuse traces.
 """
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
-import time
-from datetime import datetime, timezone
+from typing import Literal
 
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
-from langgraph.types import Send
+from langgraph.prebuilt import ToolNode
 
 from src.config import DEFAULT_RESEARCH_MODEL
-from src.core.llm_utils import acall_llm
+from src.core.llm_utils import _build_llm, acall_llm
 from src.core.research_utils import deduplicate_papers
 from src.graph.agents.tools.search_tools import search_asta
-from src.graph.state import LBDAgentState, LBDConceptFetchState
+from src.graph.state import LBDAgentState
 
 logger = logging.getLogger(__name__)
 
+_MAX_ROUNDS = 3            # safety cap — normally exits after 1-2 rounds
 _MAX_CONCEPTS_FOR_FETCH = 5
 
 
 # ---------------------------------------------------------------------------
-# Node: lbd_start — trivial entry enabling parallel fan-out
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-async def lbd_start(state: LBDAgentState, config: RunnableConfig) -> dict:
-    """Trivial entry node — hub that fans out to lbd_extract_concepts and
-    lbd_broad_search simultaneously from a single source node."""
-    return {}
-
-
-# ---------------------------------------------------------------------------
-# Node: lbd_broad_search — broad ASTA search on original query (parallel)
-# ---------------------------------------------------------------------------
-
-
-async def lbd_broad_search(state: LBDAgentState, config: RunnableConfig) -> dict:
-    """Broad ASTA search on original query. Runs in parallel with
-    lbd_extract_concepts. Results join at lbd_discover_connections."""
-    if state.get("broad_search_results") is not None:
-        return {}
-
+def _parse_papers_from_content(content: str) -> list[dict]:
+    """Parse a ToolMessage content string into a list of paper dicts."""
+    if not content:
+        return []
     try:
-        papers = await search_asta.ainvoke({"query": state["query"], "top_k": 10})
-        return {"broad_search_results": papers or []}
-    except Exception as exc:
-        logger.warning("lbd_broad_search failed: %s", exc)
-        return {
-            "broad_search_results": [],
-            "errors": [f"lbd_broad_search: {exc}"],
-        }
-
-
-# ---------------------------------------------------------------------------
-# Node: lbd_extract_concepts — LLM extracts seed concepts
-# ---------------------------------------------------------------------------
-
-
-async def lbd_extract_concepts(state: LBDAgentState, config: RunnableConfig) -> dict:
-    """LLM: extract 3-7 seed concepts from query for Swanson ABC discovery."""
-    if state.get("seed_concepts") is not None:
-        return {}
-
-    from src.prompts.research_prompts import LBD_CONCEPT_SYSTEM, LBD_CONCEPT_TEMPLATE
-
-    model = (config.get("configurable") or {}).get("research_model", DEFAULT_RESEARCH_MODEL)
+        result = json.loads(content)
+        return result if isinstance(result, list) else []
+    except (json.JSONDecodeError, ValueError):
+        pass
     try:
-        response = await acall_llm(
-            LBD_CONCEPT_TEMPLATE.format(query=state["query"]),
-            LBD_CONCEPT_SYSTEM,
-            model=model,
-            config=config,
-        )
-        concepts = _parse_concepts(response)
-    except Exception as exc:
-        logger.warning("lbd_extract_concepts failed: %s", exc)
-        return {
-            "seed_concepts": [state["query"]],
-            "errors": [f"lbd_extract_concepts: {exc}"],
-        }
-
-    return {"seed_concepts": concepts[:_MAX_CONCEPTS_FOR_FETCH]}
+        result = ast.literal_eval(content)
+        return result if isinstance(result, list) else []
+    except Exception:
+        return []
 
 
 def _parse_concepts(text: str) -> list[str]:
@@ -162,101 +93,137 @@ def _parse_concepts(text: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Conditional edge: lbd_dispatch_concepts — pure router, returns list[Send]
+# Node: lbd_agent — LLM with bound search_asta tool
 # ---------------------------------------------------------------------------
 
 
-async def lbd_dispatch_concepts(state: LBDAgentState) -> list[Send] | str:
-    """Fan out: one Send per seed concept. Used as conditional edge function."""
-    concepts = state.get("seed_concepts") or [state["query"]]
-    sends = []
-    for concept in concepts[:_MAX_CONCEPTS_FOR_FETCH]:
-        sends.append(Send("lbd_fetch_concept_papers", LBDConceptFetchState(
-            concept=concept,
-            query=state["query"],
-            top_k=15,
-            result=None,
-        )))
-    return sends or "lbd_collect_concept_papers"
+async def lbd_agent(state: LBDAgentState, config: RunnableConfig) -> dict:
+    """LLM agent node: extracts concepts and calls search_asta for each.
 
-
-# ---------------------------------------------------------------------------
-# Node: lbd_fetch_concept_papers — worker, HTTP only
-# ---------------------------------------------------------------------------
-
-
-async def lbd_fetch_concept_papers(state: LBDConceptFetchState, config: RunnableConfig) -> dict:
-    """Worker: search ASTA for papers about one concept. HTTP only, no LLM."""
-    if state.get("result") is not None:
-        return {"concept_papers": state["result"]}
-
-    start = time.monotonic()
-    called_at = datetime.now(timezone.utc).isoformat()
-    concept = state["concept"]
-
-    try:
-        papers = await search_asta.ainvoke({"query": concept, "top_k": state["top_k"]})
-        duration_ms = int((time.monotonic() - start) * 1000)
-        trace = {
-            "tool_name": "search_asta",
-            "called_at": called_at,
-            "duration_ms": duration_ms,
-            "success": True,
-            "concept": concept,
-            "result_count": len(papers) if papers else 0,
-        }
-        return {"concept_papers": papers or [], "tool_traces": [trace]}
-    except Exception as exc:
-        duration_ms = int((time.monotonic() - start) * 1000)
-        return {
-            "errors": [f"lbd_fetch_{concept}: {exc}"],
-            "tool_traces": [{
-                "tool_name": "search_asta",
-                "called_at": called_at,
-                "duration_ms": duration_ms,
-                "success": False,
-                "concept": concept,
-                "error_message": str(exc),
-            }],
-        }
-
-
-# ---------------------------------------------------------------------------
-# Node: lbd_collect_concept_papers — reducer, deduplicates concept papers
-# ---------------------------------------------------------------------------
-
-
-async def lbd_collect_concept_papers(state: LBDAgentState, config: RunnableConfig) -> dict:
-    """Deduplicate papers collected from concept fetch workers.
-    Writes paper_count based on concept_papers only (broad_search_results not yet joined).
-    merged_papers (concept + broad, fully deduped) is written by lbd_discover_connections.
+    On the first call the system + user messages are injected. Subsequent
+    calls continue the conversation with tool results already in state.
+    Max _MAX_ROUNDS calls total; returns {} to force exit if exceeded.
     """
-    all_papers = state.get("concept_papers") or []
-    unique = deduplicate_papers(all_papers)
-    return {"paper_count": len(unique)}
+    rounds = state.get("agent_rounds") or 0
+    if rounds >= _MAX_ROUNDS:
+        return {}
+
+    existing_messages: list[AnyMessage] = list(state.get("messages") or [])
+    first_call = not existing_messages
+
+    if first_call:
+        from src.prompts.research_prompts import LBD_AGENT_SYSTEM, LBD_AGENT_USER
+        existing_messages = [
+            SystemMessage(content=LBD_AGENT_SYSTEM),
+            HumanMessage(content=LBD_AGENT_USER.format(
+                query=state["query"],
+                context=state.get("context") or "",
+            )),
+        ]
+
+    model_name = (config.get("configurable") or {}).get("research_model", DEFAULT_RESEARCH_MODEL)
+    try:
+        llm = _build_llm(model_name, max_tokens=1024).bind_tools([search_asta])
+        response = await llm.ainvoke(existing_messages, config=config)
+    except Exception as exc:
+        logger.error("lbd_agent LLM call failed: %s", exc)
+        return {"errors": [f"lbd_agent: {exc}"]}
+
+    new_messages: list[AnyMessage] = (
+        existing_messages + [response] if first_call else [response]
+    )
+    return {"messages": new_messages, "agent_rounds": rounds + 1}
 
 
 # ---------------------------------------------------------------------------
-# Node: lbd_discover_connections — join node, single dedup, LLM B-term extraction
+# Routing: _route_lbd — decides tool loop vs. collect
+# ---------------------------------------------------------------------------
+
+
+def _route_lbd(state: LBDAgentState) -> Literal["lbd_tools", "lbd_collect_papers"]:
+    """Route to lbd_tools if the last message has pending tool calls, else collect."""
+    messages: list[AnyMessage] = state.get("messages") or []
+    if not messages:
+        return "lbd_collect_papers"
+    last = messages[-1]
+    rounds = state.get("agent_rounds") or 0
+    if rounds >= _MAX_ROUNDS:
+        return "lbd_collect_papers"
+    if hasattr(last, "tool_calls") and last.tool_calls:
+        return "lbd_tools"
+    return "lbd_collect_papers"
+
+
+# ---------------------------------------------------------------------------
+# ToolNode: lbd_tools — executes search_asta tool calls from the last AIMessage
+# ---------------------------------------------------------------------------
+
+lbd_tools = ToolNode([search_asta])
+
+
+# ---------------------------------------------------------------------------
+# Node: lbd_collect_papers — extract papers + concepts from messages
+# ---------------------------------------------------------------------------
+
+
+async def lbd_collect_papers(state: LBDAgentState, config: RunnableConfig) -> dict:
+    """Extract papers from search_asta ToolMessages and concepts from tool call args.
+
+    seed_concepts are derived from the query arguments of each search_asta call
+    that differ from the main query (i.e. concept-level searches, not the broad
+    search on the full query).
+    """
+    all_papers: list[dict] = []
+
+    for msg in (state.get("messages") or []):
+        if not isinstance(msg, ToolMessage):
+            continue
+        if getattr(msg, "name", "") != "search_asta":
+            continue
+        papers = _parse_papers_from_content(msg.content)
+        all_papers.extend(papers)
+
+    # Extract concept queries from tool_calls in AIMessages
+    concepts: list[str] = []
+    main_query_lower = state["query"].lower().strip()
+    for msg in (state.get("messages") or []):
+        if not isinstance(msg, AIMessage):
+            continue
+        for tc in getattr(msg, "tool_calls", None) or []:
+            if tc.get("name") != "search_asta":
+                continue
+            q = (tc.get("args") or {}).get("query", "")
+            if q and q.lower().strip() != main_query_lower:
+                concepts.append(q)
+
+    merged = deduplicate_papers(all_papers)
+
+    return {
+        "merged_papers": merged,
+        "seed_concepts": concepts[:_MAX_CONCEPTS_FOR_FETCH] if concepts else [state["query"]],
+        "paper_count": len(merged),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Node: lbd_discover_connections — LLM B-term extraction from merged_papers
 # ---------------------------------------------------------------------------
 
 
 async def lbd_discover_connections(state: LBDAgentState, config: RunnableConfig) -> dict:
-    """Join node: lbd_collect_concept_papers and lbd_broad_search both converge here.
-    At this point both concept_papers and broad_search_results are in state.
-    Single dedup point: writes merged_papers. Then extracts B-term bridges via LLM.
+    """LLM: extract B-term bridges from merged_papers for Swanson ABC discovery.
+
+    Reads merged_papers written by lbd_collect_papers.
+    Does NOT re-fetch or re-deduplicate — single dedup already done upstream.
     """
     if state.get("discovered_concepts") is not None:
         return {}
 
     from src.prompts.research_prompts import LBD_CONCEPT_SYSTEM, LBD_CONCEPT_TEMPLATE
 
-    merged = deduplicate_papers(
-        (state.get("concept_papers") or []) + (state.get("broad_search_results") or [])
-    )
-
+    merged = state.get("merged_papers") or []
     if not merged:
-        return {"merged_papers": [], "discovered_concepts": []}
+        return {"discovered_concepts": []}
 
     papers_text = "\n\n".join(
         f"[{i}] {p.get('title', '')} ({p.get('year', '?')}): {(p.get('abstract') or '')[:250]}"
@@ -273,13 +240,12 @@ async def lbd_discover_connections(state: LBDAgentState, config: RunnableConfig)
     except Exception as exc:
         logger.warning("lbd_discover_connections b-term extraction failed: %s", exc)
         return {
-            "merged_papers": merged,
             "discovered_concepts": [],
             "errors": [f"lbd_discover_connections: {exc}"],
         }
 
     discovered = [{"term": t, "type": "bridge"} for t in b_terms[:10]]
-    return {"merged_papers": merged, "discovered_concepts": discovered}
+    return {"discovered_concepts": discovered}
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +255,7 @@ async def lbd_discover_connections(state: LBDAgentState, config: RunnableConfig)
 
 async def lbd_synthesise(state: LBDAgentState, config: RunnableConfig) -> dict:
     """LLM: write narrative summary of discovered connections.
-    Reads merged_papers written by lbd_discover_connections — no re-deduplication.
+    Reads merged_papers written by lbd_collect_papers — no re-deduplication.
     """
     if state.get("narrative") is not None:
         return {}
@@ -365,36 +331,24 @@ async def lbd_finalise(state: LBDAgentState, config: RunnableConfig) -> dict:
 def build_lbd_graph():
     builder = StateGraph(LBDAgentState)
 
-    builder.add_node("lbd_start", lbd_start)
-    builder.add_node("lbd_broad_search", lbd_broad_search)
-    builder.add_node("lbd_extract_concepts", lbd_extract_concepts)
-    # lbd_dispatch_concepts is a conditional edge function, not a node
-    builder.add_node("lbd_fetch_concept_papers", lbd_fetch_concept_papers)
-    builder.add_node("lbd_collect_concept_papers", lbd_collect_concept_papers)
+    builder.add_node("lbd_agent", lbd_agent)
+    builder.add_node("lbd_tools", lbd_tools)
+    builder.add_node("lbd_collect_papers", lbd_collect_papers)
     builder.add_node("lbd_discover_connections", lbd_discover_connections)
     builder.add_node("lbd_synthesise", lbd_synthesise)
     builder.add_node("lbd_finalise", lbd_finalise)
 
-    # ── Parallel branches from lbd_start ─────────────────────────────────────
-    builder.add_edge(START, "lbd_start")
-    builder.add_edge("lbd_start", "lbd_extract_concepts")
-    builder.add_edge("lbd_start", "lbd_broad_search")
-
-    # Branch 1: concept extraction → per-concept fan-out → collect
+    builder.add_edge(START, "lbd_agent")
     builder.add_conditional_edges(
-        "lbd_extract_concepts",
-        lbd_dispatch_concepts,
+        "lbd_agent",
+        _route_lbd,
         {
-            "lbd_fetch_concept_papers": "lbd_fetch_concept_papers",
-            "lbd_collect_concept_papers": "lbd_collect_concept_papers",
+            "lbd_tools": "lbd_tools",
+            "lbd_collect_papers": "lbd_collect_papers",
         },
     )
-    builder.add_edge("lbd_fetch_concept_papers", "lbd_collect_concept_papers")
-
-    # ── Join at lbd_discover_connections ─────────────────────────────────────
-    builder.add_edge("lbd_collect_concept_papers", "lbd_discover_connections")
-    builder.add_edge("lbd_broad_search", "lbd_discover_connections")
-
+    builder.add_edge("lbd_tools", "lbd_agent")
+    builder.add_edge("lbd_collect_papers", "lbd_discover_connections")
     builder.add_edge("lbd_discover_connections", "lbd_synthesise")
     builder.add_edge("lbd_synthesise", "lbd_finalise")
     builder.add_edge("lbd_finalise", END)

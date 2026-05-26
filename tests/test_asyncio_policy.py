@@ -193,17 +193,21 @@ def test_deep_web_primary_timeout_pattern():
 
 
 def test_all_llm_nodes_have_state_guards():
-    """Key LLM worker nodes must contain state guards (skip-if-already-computed)."""
+    """Key LLM worker nodes must contain state guards (skip-if-already-computed).
+
+    slr_agent and lbd_agent guard via agent_rounds cap instead of result check
+    (the loop is inherently bounded, not idempotent by result).
+    """
     checks = [
         (
-            SRC_DIR / "graph" / "agents" / "slr_graph.py",
-            "slr_fetch_source",
-            'state.get("result")',
+            SRC_DIR / "graph" / "subgraphs" / "slr.py",
+            "slr_agent",
+            "agent_rounds",
         ),
         (
-            SRC_DIR / "graph" / "agents" / "lbd_graph.py",
-            "lbd_fetch_concept_papers",
-            'state.get("result")',
+            SRC_DIR / "graph" / "subgraphs" / "lbd.py",
+            "lbd_agent",
+            "agent_rounds",
         ),
         (
             SRC_DIR / "graph" / "agents" / "deep_web_graph.py",
