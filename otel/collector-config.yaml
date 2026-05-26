@@ -1,0 +1,48 @@
+# OpenTelemetry Collector configuration.
+#
+# Receives spans from the graph process over gRPC/HTTP and fans them out to
+# LangSmith and the self-hosted Langfuse instance simultaneously.
+#
+# Required environment variables (set in docker-compose.yml or .env):
+#   LANGCHAIN_API_KEY          — LangSmith API key (same key used for native tracing)
+#   LANGFUSE_OTEL_BASIC_AUTH   — base64(pk-lf-xxx:sk-lf-xxx)
+#                                Generate: echo -n "pk-lf-xxx:sk-lf-xxx" | base64
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 512
+
+exporters:
+  # LangSmith — native OTEL endpoint
+  otlp_http/langsmith:
+    endpoint: https://api.smith.langchain.com/otel
+    headers:
+      x-api-key: ${LANGCHAIN_API_KEY}
+
+  # Langfuse — self-hosted OTEL endpoint
+  # x-langfuse-ingestion-version: "4" enables the v4 fast-preview data model
+  otlp_http/langfuse:
+    endpoint: http://langfuse-server:3000/api/public/otel
+    headers:
+      Authorization: Basic ${LANGFUSE_OTEL_BASIC_AUTH}
+      x-langfuse-ingestion-version: "4"
+
+  # Debug logging — disable in production by removing from the pipeline below
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp_http/langsmith, otlp_http/langfuse, debug]

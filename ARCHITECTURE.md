@@ -24,6 +24,7 @@ Design document for the LangGraph-native rewrite of the NQPR (quarterly portfoli
 12. [Send() Usage Summary](#12-send-usage-summary)
 13. [Out-of-Scope Graphs — evidence_audit and gs_verifier](#13-out-of-scope-graphs--evidence_audit-and-gs_verifier)
 14. [Python Dependencies](#14-python-dependencies)
+15. [Observability](#15-observability)
 
 ---
 
@@ -1381,3 +1382,70 @@ markdown → HTML (python-markdown + optimized tables) → PDF (weasyprint A4)
 
 - **`src/core/report_assembler.py`** calls `render_confusion_matrix` + `render_scatter_plot` and embeds the base64 PNGs inline in the markdown report.
 - **`src/graph/nodes/deliver.py`** calls `render_pdf` after copying `final_report.md`; sets `state["final_report_pdf_path"]` on success.
+
+---
+
+## 15. Observability
+
+### Fan-out architecture
+
+```
+Graph process
+    │
+    │  OTEL SDK → grpc:4317
+    ▼
+OTEL Collector  (otel-collector container)
+    │
+    ├──► LangSmith  (https://api.smith.langchain.com/otel)
+    └──► Langfuse   (http://langfuse-server:3000/api/public/otel)
+```
+
+The graph emits **one** OTEL stream. The collector multiplexes it to both backends. Adding a third destination (Honeycomb, Jaeger, etc.) requires only a collector config change — no application code changes.
+
+### Initialization
+
+`src/observability.py` exposes `init_tracing()`, called once at process startup in `main.py` before the graph is compiled. It is idempotent (safe to call multiple times) and fails silently when the collector endpoint is unreachable.
+
+`LangchainInstrumentor` is activated inside `init_tracing()`. It auto-instruments every LangChain/LangGraph call — all `acall_llm` invocations, `ChatAnthropic`, `ChatOpenAI`, and the Responses API path in `deep_web.py` are captured as OTEL spans automatically. **No per-node instrumentation code is required.**
+
+`RunnableConfig` threading through every node (already in place) is what causes LangChain to attach LLM spans as children of their parent node span. Without `config` passed through, every LLM call appears as a root-level orphan span.
+
+### Environment variables
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | Collector gRPC endpoint |
+| `OTEL_SERVICE_NAME` | `prisma-langgraphed` | Service name tag on all spans |
+| `OTEL_SDK_DISABLED` | — | Set to `true` to disable tracing (used in CI/tests) |
+| `LANGSMITH_API_KEY` | — | Forwarded by the collector to LangSmith |
+| `LANGFUSE_OTEL_BASIC_AUTH` | — | `base64(pk-lf-xxx:sk-lf-xxx)` for Langfuse |
+| `LANGFUSE_NEXTAUTH_SECRET` | — | Langfuse auth secret (`openssl rand -base64 32`) |
+| `LANGFUSE_SALT` | — | Langfuse salt (`openssl rand -base64 32`) |
+
+### UI access
+
+| Backend | URL | Notes |
+|---|---|---|
+| LangSmith | `https://smith.langchain.com` → project `prisma-langgraphed` | Cloud-hosted; requires `LANGSMITH_API_KEY` |
+| Langfuse | `http://localhost:3000` (Docker) | Self-hosted; spin up with `docker compose up langfuse-server langfuse-worker postgres` |
+
+### Local dev without Docker
+
+The graph can emit traces locally without running the full Docker stack:
+
+```bash
+# Start only the collector and Langfuse (no graph container)
+docker compose up otel-collector langfuse-server langfuse-worker postgres
+
+# Run the graph locally with live tracing
+source .env && langgraph dev
+```
+
+`docker compose up graph postgres` still works without the observability stack — `init_tracing()` fails silently when the collector is unreachable.
+
+### Calls not auto-instrumented
+
+| Call site | Reason | Action |
+|---|---|---|
+| `src/backends/local.py` — `OpenAI().embeddings.create()` | Raw SDK, not LangChain | Wrap with manual span if embedding latency needs tracing |
+| `src/backends/qdrant.py` — `OpenAI().embeddings.create()` | Raw SDK, not LangChain | Same as above |

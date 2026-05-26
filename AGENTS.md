@@ -729,18 +729,30 @@ result = await asyncio.to_thread(_read_json, path)
 
 ## 10. TRACING
 
-### Auto-instrumentation coverage
+### Architecture
 
-Every LLM call in this codebase goes through `acall_llm` in `src/core/llm_utils.py`, which delegates to LangChain's `ChatAnthropic` or `ChatOpenAI`. When `LangchainInstrumentor` is active, every `.ainvoke` call is automatically captured as an OTEL span — no per-call instrumentation code is required.
+Traces fan out at the OTEL collector level — the graph emits one OTEL stream, and the collector forwards it to both backends. See `ARCHITECTURE.md §15` for the full fan-out diagram and environment variable reference.
 
-`LangchainInstrumentor` is initialised once at startup from `src/core/telemetry.py`:
-
-```python
-from opentelemetry.instrumentation.langchain import LangchainInstrumentor
-LangchainInstrumentor().instrument()
+```
+Graph process
+    │
+    │  OTEL SDK → grpc:4317
+    ▼
+OTEL Collector  (otel-collector container)
+    │
+    ├──► LangSmith  (https://api.smith.langchain.com/otel)
+    └──► Langfuse   (http://langfuse-server:3000/api/public/otel)
 ```
 
-This covers all calls made via `acall_llm`, including structured-output calls (`llm.with_structured_output(schema).ainvoke(...)`).
+### Initialization
+
+`src/observability.init_tracing()` is called once from `main.py` before the graph is compiled. It is idempotent and fails silently if the collector is unreachable. `LangchainInstrumentor` is activated inside `init_tracing()` — **no per-agent or per-node instrumentation code is needed**.
+
+`src/core/telemetry.setup_telemetry()` delegates to `init_tracing()` for backward compatibility.
+
+### Auto-instrumentation coverage
+
+Every LLM call in this codebase goes through `acall_llm` in `src/core/llm_utils.py`, which delegates to LangChain's `ChatAnthropic` or `ChatOpenAI`. When `LangchainInstrumentor` is active, every `.ainvoke` call is automatically captured as an OTEL span — including structured-output calls (`llm.with_structured_output(schema).ainvoke(...)`).
 
 ### Why `config: RunnableConfig` matters for span nesting
 
@@ -761,13 +773,21 @@ async def my_node(state: WorkflowState, config: RunnableConfig) -> dict:
 
 ### Calls that are NOT auto-instrumented
 
-Two categories of raw SDK calls bypass `acall_llm` and are not captured by `LangchainInstrumentor`:
+No agent in this codebase makes raw `anthropic` SDK calls outside of LangChain — all LLM calls go through `acall_llm` or LangChain's `ChatOpenAI(use_responses_api=True)` (`deep_web.py`), both of which are auto-instrumented.
 
-**1. Embedding calls in search backends**
+The only uninstrumented calls are embedding queries in search backends:
 
-`src/backends/local.py` and `src/backends/qdrant.py` call `OpenAI().embeddings.create()` directly for query-time embedding. These are retrieval operations, not agent LLM calls, and have negligible cost per call. They can be wrapped with a manual span if embedding latency becomes a tracing concern:
+| Call site | Reason | Action |
+|---|---|---|
+| `src/backends/local.py` — `OpenAI().embeddings.create()` | Raw SDK, not LangChain | Wrap with manual span if embedding latency needs tracing |
+| `src/backends/qdrant.py` — `OpenAI().embeddings.create()` | Raw SDK, not LangChain | Same as above |
+
+Manual span example for embedding calls:
 
 ```python
+from opentelemetry import trace
+tracer = trace.get_tracer(__name__)
+
 with tracer.start_as_current_span("embed_query") as span:
     span.set_attribute("model", self._embed_model)
     resp = self._openai_client.embeddings.create(input=[query], model=self._embed_model)
@@ -779,4 +799,4 @@ with tracer.start_as_current_span("embed_query") as span:
 |---|---|---|---|
 | All `acall_llm` callers (every node, every agent) | Yes | Yes — via `LangchainInstrumentor` | Pass `config` through |
 | `deep_web.py` — `ChatOpenAI(use_responses_api=True)` | Yes | Yes — via `LangchainInstrumentor` | Pass `config` through (already done) |
-| `local.py`, `qdrant.py` — `embeddings.create()` | No | No | Add manual span if needed |
+| `local.py`, `qdrant.py` — `embeddings.create()` | No | No | Add manual span if embedding latency tracking needed |
