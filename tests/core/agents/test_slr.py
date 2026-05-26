@@ -20,12 +20,11 @@ _MOCK_PAPERS = [
 
 
 async def test_run_returns_thesis_and_results():
-    with patch("src.core.agents.slr.OpenAlexClient") as MockOA, \
-         patch("src.core.agents.slr.AstaClient") as MockAsta, \
+    with patch("src.tools.literature_tools.OpenAlexClient") as MockOpenAlex, \
+         patch("src.tools.literature_tools.AstaClient") as MockAsta, \
          patch("src.core.agents.slr.acall_llm", new=AsyncMock(return_value="Synthesised thesis.")):
-        MockOA.return_value.search = AsyncMock(return_value=_MOCK_PAPERS)
+        MockOpenAlex.return_value.search = AsyncMock(return_value=_MOCK_PAPERS)
         MockAsta.return_value.search = AsyncMock(return_value=[])
-
         result = await run(task_id="T1", query="malaria vaccines", linked_scope="S1")
 
     assert result["task_id"] == "T1"
@@ -37,12 +36,11 @@ async def test_run_returns_thesis_and_results():
 
 async def test_run_deduplicates_papers():
     duplicate = dict(_MOCK_PAPERS[0])  # same title as P1
-    with patch("src.core.agents.slr.OpenAlexClient") as MockOA, \
-         patch("src.core.agents.slr.AstaClient") as MockAsta, \
+    with patch("src.tools.literature_tools.OpenAlexClient") as MockOpenAlex, \
+         patch("src.tools.literature_tools.AstaClient") as MockAsta, \
          patch("src.core.agents.slr.acall_llm", new=AsyncMock(return_value="Thesis.")):
-        MockOA.return_value.search = AsyncMock(return_value=_MOCK_PAPERS)
+        MockOpenAlex.return_value.search = AsyncMock(return_value=_MOCK_PAPERS)
         MockAsta.return_value.search = AsyncMock(return_value=[duplicate])
-
         result = await run(task_id="T1", query="malaria")
 
     # duplicate title should be filtered out
@@ -51,11 +49,10 @@ async def test_run_deduplicates_papers():
 
 
 async def test_run_no_papers_returns_empty_thesis():
-    with patch("src.core.agents.slr.OpenAlexClient") as MockOA, \
-         patch("src.core.agents.slr.AstaClient") as MockAsta:
-        MockOA.return_value.search = AsyncMock(return_value=[])
+    with patch("src.tools.literature_tools.OpenAlexClient") as MockOpenAlex, \
+         patch("src.tools.literature_tools.AstaClient") as MockAsta:
+        MockOpenAlex.return_value.search = AsyncMock(return_value=[])
         MockAsta.return_value.search = AsyncMock(return_value=[])
-
         result = await run(task_id="T1", query="obscure query")
 
     assert result["success"] is True
@@ -69,12 +66,11 @@ async def test_run_no_papers_returns_empty_thesis():
 
 
 async def test_run_search_exception_still_succeeds_via_other_source():
-    with patch("src.core.agents.slr.OpenAlexClient") as MockOA, \
-         patch("src.core.agents.slr.AstaClient") as MockAsta, \
+    with patch("src.tools.literature_tools.OpenAlexClient") as MockOpenAlex, \
+         patch("src.tools.literature_tools.AstaClient") as MockAsta, \
          patch("src.core.agents.slr.acall_llm", new=AsyncMock(return_value="Thesis from Asta only.")):
-        MockOA.return_value.search = AsyncMock(side_effect=RuntimeError("OpenAlex down"))
+        MockOpenAlex.return_value.search = AsyncMock(side_effect=RuntimeError("OpenAlex down"))
         MockAsta.return_value.search = AsyncMock(return_value=_MOCK_PAPERS)
-
         result = await run(task_id="T1", query="q")
 
     assert result["success"] is True

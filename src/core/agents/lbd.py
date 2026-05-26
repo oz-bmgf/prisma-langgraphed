@@ -13,8 +13,8 @@ from langchain_core.runnables import RunnableConfig
 from pydantic import BaseModel
 
 from src.config import DEFAULT_RESEARCH_MODEL, LBD_TIMEOUT_SECONDS
-from src.core.agents.asta import AstaClient
 from src.core.llm_utils import acall_llm
+from src.tools.literature_tools import search_asta_papers
 
 logger = logging.getLogger(__name__)
 
@@ -89,8 +89,6 @@ async def _run_lbd(task_id: str, query: str, *, model: str, config: RunnableConf
         LBD_SYNTHESIS_TEMPLATE,
     )
 
-    asta = AstaClient()
-
     # Step 1: Extract A-terms from query
     concept_response = await acall_llm(
         LBD_CONCEPT_TEMPLATE.format(query=query),
@@ -103,7 +101,7 @@ async def _run_lbd(task_id: str, query: str, *, model: str, config: RunnableConf
     # Step 2: Search A→B (what does A connect to?)
     # asyncio-APPROVED-2: concurrent HTTP — parallel Asta searches for A-terms
     ab_results = await asyncio.gather(
-        *[asta.search(term, max_results=15) for term in a_terms[:3]],
+        *[search_asta_papers.ainvoke({"query": term, "max_results": 15}, config=config) for term in a_terms[:3]],
         return_exceptions=True,
     )
     ab_papers: list[dict] = []
@@ -130,7 +128,7 @@ async def _run_lbd(task_id: str, query: str, *, model: str, config: RunnableConf
     if b_terms:
         # asyncio-APPROVED-2: concurrent HTTP — parallel Asta searches for B-terms
         bc_results = await asyncio.gather(
-            *[asta.search(f"{term} {query}", max_results=10) for term in b_terms[:3]],
+            *[search_asta_papers.ainvoke({"query": f"{term} {query}", "max_results": 10}, config=config) for term in b_terms[:3]],
             return_exceptions=True,
         )
         for r in bc_results:

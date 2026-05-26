@@ -1,6 +1,7 @@
 """Deep web research agent using OpenAI o3-deep-research with web_search_preview.
 
-Primary path  : openai.AsyncOpenAI().responses.create(model=PRIMARY, tools=[web_search_preview])
+Primary path  : ChatOpenAI(use_responses_api=True).bind_tools([web_search_preview])
+                Auto-instrumented via LangchainInstrumentor; config threads trace context.
 Fallback path : iterative acall_llm rounds (FALLBACK_MODEL) when primary is unavailable.
 
 Never raises — returns DeepWebResult(success=False) on any error.
@@ -10,14 +11,10 @@ from __future__ import annotations
 import asyncio
 import logging
 
-from pydantic import BaseModel
-
-try:
-    import openai as openai
-except ImportError:
-    openai = None  # type: ignore[assignment]
-
+from langchain_core.messages import HumanMessage
 from langchain_core.runnables import RunnableConfig
+from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
 
 from src.config import (
     DEEP_WEB_FALLBACK_MODEL,
@@ -57,7 +54,7 @@ async def deep_web_research(
     try:
         # asyncio-APPROVED-3: wait_for wraps single external primary model call with timeout
         return await asyncio.wait_for(
-            _primary_research(question, context, model=primary),
+            _primary_research(question, context, model=primary, config=config),
             timeout=max_secs,
         )
     except Exception as exc:
@@ -82,39 +79,38 @@ async def deep_web_research(
 
 
 async def _primary_research(
-    question: str, context: str, *, model: str
+    question: str,
+    context: str,
+    *,
+    model: str,
+    config: RunnableConfig | None = None,
 ) -> DeepWebResult:
-    if openai is None:
-        raise ImportError("openai package not installed")
+    prompt = f"{context}\n\nQuestion: {question}" if context else question
 
-    prompt = question
-    if context:
-        prompt = f"{context}\n\nQuestion: {question}"
-
-    client = openai.AsyncOpenAI()
-    response = await client.responses.create(
+    llm = ChatOpenAI(
         model=model,
-        input=prompt,
-        tools=[{"type": "web_search_preview"}],
-    )
+        use_responses_api=True,
+        output_version="responses/v1",
+    ).bind_tools([{"type": "web_search_preview"}])
 
-    # output_text is a convenience property that joins all text output blocks
-    answer = getattr(response, "output_text", "") or ""
-    if not answer:
-        for item in getattr(response, "output", []) or []:
-            if getattr(item, "type", "") == "message":
-                for block in getattr(item, "content", []) or []:
-                    text = getattr(block, "text", "")
-                    if text:
-                        answer = text
-                        break
-            if answer:
-                break
+    response = await llm.ainvoke([HumanMessage(content=prompt)], config=config)
+
+    answer = ""
+    sources: list[str] = []
+    for block in response.content or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            answer = block.get("text", "")
+            sources = [
+                a.get("url", "")
+                for a in block.get("annotations", [])
+                if a.get("type") == "url_citation" and a.get("url")
+            ]
+            break
 
     return DeepWebResult(
         question=question,
         answer=answer,
-        sources=[],
+        sources=sources,
         model_used=model,
         search_rounds=1,
         success=True,

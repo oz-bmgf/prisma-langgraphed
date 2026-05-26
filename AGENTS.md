@@ -543,7 +543,7 @@ When implementing any node or core function, read the corresponding original fil
 | Rule | Rationale |
 |---|---|
 | All research agents live in `src/core/agents/` | The `research.py` subgraph workers import from `src.core.agents`; never import from `src.core` directly (old lazy-import pattern) |
-| `deep_web.py` primary path uses `openai.AsyncOpenAI().responses.create()` — this is the one legitimate exception to "all LLM calls through `acall_llm`" | The OpenAI Responses API with `web_search_preview` tool is not a chat completion and cannot be routed through LangChain ChatOpenAI |
+| `deep_web.py` primary path uses `ChatOpenAI(use_responses_api=True, output_version="responses/v1").bind_tools([{"type": "web_search_preview"}])` — does NOT go through `acall_llm` | The OpenAI Responses API requires `use_responses_api=True`; `acall_llm` uses `ChatOpenAI` without that flag. The call is still LangChain-native and auto-instrumented. |
 | All other agent LLM calls go through `acall_llm` | SLR synthesis, LBD concept extraction/synthesis, and query rewriting all use `acall_llm` |
 | Agent `run()` functions never raise | Return a dict with `success=False` and `error_message` on any failure; the worker's try/except is the last safety net |
 | `AstaClient` in `src/core/agents/asta.py` is the authoritative implementation | `src/core/asta_client.py` is a thin re-export for `science_tools.py` backward compatibility only |
@@ -763,24 +763,7 @@ async def my_node(state: WorkflowState, config: RunnableConfig) -> dict:
 
 Two categories of raw SDK calls bypass `acall_llm` and are not captured by `LangchainInstrumentor`:
 
-**1. `deep_web.py` primary path — OpenAI Responses API**
-
-`src/core/agents/deep_web.py` uses `openai.AsyncOpenAI().responses.create()` with the `web_search_preview` tool. This is the OpenAI Responses API, which LangChain's `ChatOpenAI` does not wrap. This is a deliberate exception documented in §8. To trace these calls, add a manual OTEL span:
-
-```python
-from opentelemetry import trace
-tracer = trace.get_tracer(__name__)
-
-with tracer.start_as_current_span("deep_web_primary") as span:
-    span.set_attribute("model", effective_model)
-    span.set_attribute("agent", "deep_web")
-    response = await asyncio.wait_for(
-        client.responses.create(model=effective_model, ...),
-        timeout=effective_timeout,
-    )
-```
-
-**2. Embedding calls in search backends**
+**1. Embedding calls in search backends**
 
 `src/backends/local.py` and `src/backends/qdrant.py` call `OpenAI().embeddings.create()` directly for query-time embedding. These are retrieval operations, not agent LLM calls, and have negligible cost per call. They can be wrapped with a manual span if embedding latency becomes a tracing concern:
 
@@ -795,5 +778,5 @@ with tracer.start_as_current_span("embed_query") as span:
 | Call site | Goes through LangChain | Auto-instrumented | Action needed |
 |---|---|---|---|
 | All `acall_llm` callers (every node, every agent) | Yes | Yes — via `LangchainInstrumentor` | Pass `config` through |
-| `deep_web.py` — `responses.create()` | No | No | Add manual OTEL span |
+| `deep_web.py` — `ChatOpenAI(use_responses_api=True)` | Yes | Yes — via `LangchainInstrumentor` | Pass `config` through (already done) |
 | `local.py`, `qdrant.py` — `embeddings.create()` | No | No | Add manual span if needed |

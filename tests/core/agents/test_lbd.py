@@ -20,7 +20,7 @@ _MOCK_PAPERS = [
 
 
 async def test_run_returns_thesis_and_concepts():
-    with patch("src.core.agents.lbd.AstaClient") as MockAsta, \
+    with patch("src.tools.literature_tools.AstaClient") as MockAsta, \
          patch("src.core.agents.lbd.acall_llm") as mock_llm:
         MockAsta.return_value.search = AsyncMock(return_value=_MOCK_PAPERS)
         mock_llm.side_effect = [

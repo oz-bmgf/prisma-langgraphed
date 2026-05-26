@@ -15,9 +15,8 @@ from pydantic import BaseModel
 from langchain_core.runnables import RunnableConfig
 
 from src.config import DEFAULT_RESEARCH_MODEL, SLR_TIMEOUT_SECONDS
-from src.core.agents.asta import AstaClient
-from src.core.agents.openalex import OpenAlexClient
 from src.core.llm_utils import acall_llm
+from src.tools.literature_tools import search_asta_papers, search_openalex_papers
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +84,10 @@ async def run(
 async def _run_slr(task_id: str, query: str, *, model: str, config: RunnableConfig | None = None) -> SLRResult:
     from src.prompts.research_prompts import SLR_SYNTHESIS_SYSTEM, SLR_SYNTHESIS_TEMPLATE
 
-    openalex = OpenAlexClient()
-    asta = AstaClient()
-
     # asyncio-APPROVED-2: concurrent HTTP — OpenAlex and Asta searches in parallel
     openalex_papers, asta_papers = await asyncio.gather(
-        openalex.search(query, max_results=20),
-        asta.search(query, max_results=20),
+        search_openalex_papers.ainvoke({"query": query, "max_results": 20}, config=config),
+        search_asta_papers.ainvoke({"query": query, "max_results": 20}, config=config),
         return_exceptions=True,
     )
 
