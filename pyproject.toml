@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "prisma-langgraphed"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    # LangGraph runtime + checkpointers
+    "langgraph>=1.2",
+    "langgraph-checkpoint-sqlite>=3.1",
+    "aiosqlite>=0.22",
+    # LangChain-native LLM SDKs
+    "langchain-anthropic>=1.4",
+    "langchain-openai>=1.2",
+    "langchain-core>=1.4",
+    "anthropic>=0.97",
+    "openai>=2.0",
+    # Async I/O
+    "aiofiles>=23.0",
+    # Data / search
+    "numpy>=1.26",
+    "scipy>=1.12",
+    "scikit-learn>=1.4",
+    # Search backends
+    "qdrant-client>=1.9",
+    "azure-search-documents>=11.4",
+    "azure-identity>=1.16",
+    # Validation / config
+    "pydantic>=2.0",
+    "python-dotenv>=1.0",
+    # Output rendering
+    "weasyprint>=60.0",
+    "openpyxl>=3.1",
+    "pyyaml>=6.0",
+    # Observability
+    "opentelemetry-api>=1.20",
+    "opentelemetry-sdk>=1.20",
+    # HTTP API
+    "fastapi>=0.111",
+    "uvicorn[standard]>=0.29",
+    "sse-starlette>=2.1",
+    "matplotlib>=3.10.9",
+    "markdown>=3.10.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=1.0",
+    "langgraph-cli[inmem]>=0.2",
+    "httpx>=0.27",
+]
+postgres = [
+    "langgraph-checkpoint-postgres>=2.0",
+    "psycopg[binary,pool]>=3.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

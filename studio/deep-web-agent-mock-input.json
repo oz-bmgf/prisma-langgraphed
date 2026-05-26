@@ -1,0 +1,68 @@
+{
+  "_comment": "Mid-call state for deep_web_agent. Simulates entry after deep_web_try_primary has already run and FAILED (primary_result.success=false), and the fallback search rounds have completed (search_round_results populated). Next node is deep_web_collect_rounds → deep_web_synthesise_fallback → deep_web_finalise.",
+  "task_id": "rp-003",
+  "question": "What are the key findings of the WHO 2024 Global Malaria Report regarding LLIN coverage targets and distribution gaps in sub-Saharan Africa?",
+  "context": "Reviewing external evidence on global malaria control progress for a Gates Foundation quarterly program review. Specifically interested in LLIN coverage gaps, funding shortfalls, and projected targets for 2025–2030 in the highest-burden SSA countries.",
+  "model_used": null,
+  "primary_result": {
+    "success": false,
+    "error_message": "o3 deep-research API rate limit exceeded; retries exhausted after 30s timeout",
+    "answer": "",
+    "sources": []
+  },
+  "search_round_results": [
+    {
+      "round_number": 1,
+      "answer": "The WHO 2024 World Malaria Report estimates that 3.1 billion LLINs have been distributed globally since 2000. In 2023, approximately 228 million nets were delivered to sub-Saharan Africa. Despite this scale, coverage gaps remain significant: only 54% of the population at risk in SSA slept under an ITN in 2023, compared to the universal coverage target of 80%.",
+      "sources": [],
+      "success": true
+    },
+    {
+      "round_number": 2,
+      "answer": "WHO identifies funding as the primary barrier: the annual financing shortfall for LLIN programmes is estimated at $2.4 billion. Nigeria, DRC, and Niger together account for 47% of global malaria cases. In Nigeria, LLIN coverage among children under 5 declined from 43% in 2021 to 38% in 2023 due to mass campaign gaps. The Global Fund and PMI together cover ~60% of needed nets, with national governments and other donors covering less than 15%.",
+      "sources": [],
+      "success": true
+    },
+    {
+      "round_number": 3,
+      "answer": "The 2024 report introduces a revised strategy: 'next-generation vector control' calling for a shift from universal LLIN campaigns to targeted deployment of PBO and dual-active-ingredient (DAI) nets in areas with confirmed pyrethroid resistance. This affects ~35% of all LLIN procurement decisions. WHO projects that with full funding, LLIN programmes could avert an additional 580,000 malaria deaths by 2030 compared to the current trajectory.",
+      "sources": [],
+      "success": true
+    }
+  ],
+  "fallback_synthesis": null,
+  "tool_traces": [
+    {
+      "tool_name": "deep_web_primary",
+      "called_at": "2026-05-24T08:10:00Z",
+      "duration_ms": 30012,
+      "success": false,
+      "error_message": "o3 deep-research API rate limit exceeded"
+    },
+    {
+      "tool_name": "deep_web_round",
+      "called_at": "2026-05-24T08:10:31Z",
+      "duration_ms": 4200,
+      "success": true,
+      "round_number": 1
+    },
+    {
+      "tool_name": "deep_web_round",
+      "called_at": "2026-05-24T08:10:31Z",
+      "duration_ms": 3800,
+      "success": true,
+      "round_number": 2
+    },
+    {
+      "tool_name": "deep_web_round",
+      "called_at": "2026-05-24T08:10:31Z",
+      "duration_ms": 4500,
+      "success": true,
+      "round_number": 3
+    }
+  ],
+  "result": null,
+  "success": false,
+  "error_message": null,
+  "errors": []
+}

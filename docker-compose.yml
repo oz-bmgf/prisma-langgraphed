@@ -1,0 +1,39 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: langgraph
+      POSTGRES_PASSWORD: langgraph
+      POSTGRES_DB: langgraph
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langgraph"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  graph:
+    build: .
+    ports:
+      - "8125:8125"
+    env_file:
+      - .env
+    environment:
+      # Tells src/config.py (main.py CLI runs) to use AsyncPostgresSaver
+      NQPR_CHECKPOINTER_BACKEND: postgres
+      # DSN for main.py CLI runs (maps to CHECKPOINT_POSTGRES_DSN in src/config.py)
+      NQPR_CHECKPOINT_POSTGRES_DSN: postgresql://langgraph:langgraph@postgres:5432/langgraph
+      # langgraph dev reads DATABASE_URL as the --postgres-uri value,
+      # so the Studio server also checkpoints to Postgres
+      DATABASE_URL: postgresql://langgraph:langgraph@postgres:5432/langgraph
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - .:/app  # live reload in dev
+
+volumes:
+  postgres_data:

@@ -1,0 +1,49 @@
+{
+  "_comment": "Mid-call state for the research dispatch subgraph. Simulates entry after prepare_research has generated and review_research_plan has approved a plan. All four task types included so each worker branch (slr, lbd, deep_web, edison) is exercised.",
+  "research_plan": [
+    {
+      "id": "rp-001",
+      "type": "slr",
+      "query": "RCT evidence for insecticide-treated bednets reducing under-5 malaria mortality in sub-Saharan Africa",
+      "priority": "critical",
+      "linked_scope": "mock-scope-01"
+    },
+    {
+      "id": "rp-002",
+      "type": "lbd",
+      "query": "Novel mechanisms linking pyrethroid resistance to LLIN efficacy loss in Anopheles gambiae",
+      "priority": "important",
+      "linked_scope": "mock-scope-01"
+    },
+    {
+      "id": "rp-003",
+      "type": "deep_web",
+      "query": "WHO 2024 global malaria report findings on LLIN coverage targets and distribution gaps",
+      "priority": "important",
+      "linked_scope": "mock-scope-01"
+    },
+    {
+      "id": "rp-004",
+      "type": "edison",
+      "query": "cost-effectiveness of next-generation pyrethroid-PBO combination bednets in resistance settings",
+      "priority": "nice_to_have",
+      "linked_scope": "mock-scope-01"
+    },
+    {
+      "id": "rp-005",
+      "type": "slr",
+      "query": "Seasonal malaria chemoprevention SP+AQ efficacy against drug-resistant Plasmodium falciparum in Sahel",
+      "priority": "critical",
+      "linked_scope": "mock-scope-02"
+    }
+  ],
+  "research_dir": "/Users/ozgurozmen/qpr-collections/MOCK-output/research",
+  "research_results": [],
+  "slr_traces": [],
+  "lbd_traces": [],
+  "deep_web_traces": [],
+  "edison_traces": [],
+  "dispatch_results": null,
+  "edison_results": null,
+  "errors": []
+}

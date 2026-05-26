@@ -1,0 +1,23 @@
+{
+  "_comment": "Mid-call state for edison_agent. Simulates entry after edison_rewrite_query has already produced a rewritten_query. The route_rewrite_entry conditional will route directly to edison_search because skip_rewrite=false but rewritten_query is already set — edison_search reads rewritten_query preferentially. Alternatively, set skip_rewrite=true to bypass rewriting and test edison_search directly with original_query.",
+  "task_id": "rp-004",
+  "original_query": "cost-effectiveness of next-generation pyrethroid-PBO bednets",
+  "context": "Evaluating whether PBO-treated and dual-active-ingredient (DAI) LLINs justify their higher procurement cost (~$3.50–4.50 vs ~$2.00 for standard nets) in program contexts with confirmed pyrethroid resistance. Looking for health-economic analyses and cost-per-DALY-averted estimates.",
+  "skip_rewrite": false,
+  "rewritten_query": "cost-effectiveness analysis piperonyl butoxide (PBO) pyrethroid combination insecticide-treated nets versus standard LLINs malaria prevention sub-Saharan Africa pyrethroid resistance settings cost per DALY",
+  "papers": null,
+  "result_count": 0,
+  "tool_traces": [
+    {
+      "tool_name": "edison_rewrite",
+      "called_at": "2026-05-24T08:15:00Z",
+      "duration_ms": 890,
+      "success": true,
+      "query_used": "cost-effectiveness of next-generation pyrethroid-PBO bednets"
+    }
+  ],
+  "result": null,
+  "success": false,
+  "error_message": null,
+  "errors": []
+}

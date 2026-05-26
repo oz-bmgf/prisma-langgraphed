@@ -1,0 +1,17 @@
+{
+  "program": "MOCK",
+  "collection_name": "mock",
+  "base_dir": "/Users/ozgurozmen/qpr-collections",
+  "ingested_dir": "/Users/ozgurozmen/qpr-collections/MOCK-ingested",
+  "research_model": "claude-sonnet-4-6",
+  "synthesis_model": "claude-sonnet-4-6",
+  "focus": null,
+  "focus_bows": null,
+  "aux_collections": null,
+  "threads_dir": null,
+  "evidence_packs": [],
+  "link_assessments": [],
+  "science_results": [],
+  "scope_decisions": [],
+  "errors": []
+}

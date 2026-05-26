@@ -1,0 +1,20 @@
+{
+  "_comment": "Entry state for the evidence_audit diagnostic graph. Simulates a post-run audit of a completed analyst report. skip_llm_expected_docs=true keeps it fast for Studio exploration; set false to invoke the LLM-based expected-docs audit.",
+  "program": "MOCK",
+  "data_root": "/Users/ozgurozmen/qpr-collections",
+  "run_dir_name": "studio-01",
+  "top_n_files": 25,
+  "skip_llm_expected_docs": true,
+  "output_xlsx": false,
+  "output_diagnosis": true,
+  "analyst_report": null,
+  "doc_list": null,
+  "investment_scoring": null,
+  "run_dir": null,
+  "audit": null,
+  "brief_md": null,
+  "brief_path": null,
+  "workbook_path": null,
+  "rollup_md_path": null,
+  "errors": []
+}

@@ -1,0 +1,28 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "workflow":       "./src/graph/workflow.py:workflow_graph",
+    "analyze":        "./src/graph/subgraphs/analyze.py:analyze_graph",
+    "causal":         "./src/graph/subgraphs/causal.py:causal_graph",
+    "research":       "./src/graph/subgraphs/research.py:research_graph",
+    "evidence_audit": "./src/graph/evidence_audit.py:evidence_audit_graph",
+    "gs_verifier":    "./src/graph/gs_verifier.py:gs_verifier_graph",
+    "slr_agent":      "./src/graph/agents/slr_graph.py:slr_graph",
+    "lbd_agent":      "./src/graph/agents/lbd_graph.py:lbd_graph",
+    "deep_web_agent": "./src/graph/agents/deep_web_graph.py:deep_web_graph",
+    "edison_agent":   "./src/graph/agents/edison_graph.py:edison_graph"
+  },
+  "env": ".env",
+  "test_inputs": {
+    "workflow":       "./studio/workflow-mock-input.json",
+    "analyze":        "./studio/analyze-mock-input.json",
+    "causal":         "./studio/causal-mock-input.json",
+    "research":       "./studio/research-mock-input.json",
+    "evidence_audit": "./studio/evidence-audit-mock-input.json",
+    "gs_verifier":    "./studio/gs-verifier-mock-input.json",
+    "slr_agent":      "./tests/fixtures/agent_mock_inputs/slr_agent_mock_input.json",
+    "lbd_agent":      "./tests/fixtures/agent_mock_inputs/lbd_agent_mock_input.json",
+    "deep_web_agent": "./tests/fixtures/agent_mock_inputs/deep_web_agent_mock_input.json",
+    "edison_agent":   "./tests/fixtures/agent_mock_inputs/edison_agent_mock_input.json"
+  }
+}

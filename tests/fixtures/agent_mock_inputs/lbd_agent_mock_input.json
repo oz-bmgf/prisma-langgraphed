@@ -1,0 +1,53 @@
+{
+  "_comment": "Mid-call state for lbd_agent. Simulates entry after lbd_extract_concepts (seed_concepts populated) and lbd_broad_search (broad_search_results populated) have both completed. The next node lbd_dispatch_concepts will fan out per-concept to lbd_fetch_concept_papers.",
+  "task_id": "rp-002",
+  "query": "Novel mechanisms linking pyrethroid resistance to LLIN efficacy loss in Anopheles gambiae",
+  "context": "Investigating whether rising kdr mutation prevalence in Anopheles populations is a material threat to the LLIN bednet programs being reviewed. Looking for ABC-bridge concepts that connect resistance mechanisms to population-level efficacy outcomes.",
+  "seed_concepts": [
+    "pyrethroid resistance",
+    "voltage-gated sodium channel kdr mutation",
+    "piperonyl butoxide PBO synergist",
+    "Anopheles gambiae insecticide tolerance",
+    "LLIN wash resistance durability"
+  ],
+  "concept_papers": [],
+  "discovered_concepts": null,
+  "narrative": null,
+  "paper_count": 0,
+  "tool_traces": [
+    {
+      "tool_name": "search_asta",
+      "called_at": "2026-05-24T08:05:00Z",
+      "duration_ms": 1100,
+      "success": true,
+      "result_count": 3
+    }
+  ],
+  "result": null,
+  "success": false,
+  "error_message": null,
+  "errors": [],
+  "broad_search_results": [
+    {
+      "title": "Insecticide resistance in malaria vectors: an update at a global scale",
+      "authors": "Ranson H, Lissenden N",
+      "year": "2016",
+      "abstract": "Systematic review of pyrethroid resistance in Anopheles across Africa. kdr mutations (L1014F, L1014S) documented in >60 countries; metabolic resistance via CYP450s co-occurring in West Africa.",
+      "source": "asta"
+    },
+    {
+      "title": "Does pyrethroid resistance affect the efficacy of insecticide-treated bed nets?",
+      "authors": "Strode C et al.",
+      "year": "2014",
+      "abstract": "Meta-analysis of 12 studies. Pyrethroid resistance in local vectors was not consistently associated with reduced LLIN efficacy in RCTs, but association strengthened when resistance was metabolic rather than kdr alone.",
+      "source": "asta"
+    },
+    {
+      "title": "Population-level effect of pyrethroid resistance on the efficacy of LLINs in Africa",
+      "authors": "Churcher TS et al.",
+      "year": "2016",
+      "abstract": "Modelling study estimating that high levels of pyrethroid resistance could reduce LLIN effectiveness by 20–50% depending on resistance type and local mosquito density.",
+      "source": "asta"
+    }
+  ]
+}

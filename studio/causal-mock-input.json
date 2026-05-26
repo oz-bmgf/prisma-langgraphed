@@ -1,0 +1,118 @@
+{
+  "_comment": "Mid-call state for the causal subgraph. Simulates entry after analyze has already built scopes and scope_timelines. The fan-out workers (evaluate_investment_rubric, investigate_link, investigate_science_assumption, project_scope_decisions) will run from this.",
+  "scopes": [
+    {
+      "scope_id": "mock-scope-01",
+      "inv_id": "INV-001",
+      "bow_id": "BOW-Malaria-Nets",
+      "program": "MOCK",
+      "label": "Scale insecticide-treated bednet distribution in sub-Saharan Africa",
+      "causal_type": "direct",
+      "evidence_status": "partial",
+      "investments": [
+        {
+          "inv_id": "INV-001",
+          "grantee": "Mock Nets Foundation",
+          "amount_usd": 12000000,
+          "start_date": "2023-01-01",
+          "end_date": "2026-12-31"
+        }
+      ],
+      "causal_claims": [
+        {
+          "claim_id": "claim-01",
+          "claim": "Scaling LLIN distribution reduces under-5 all-cause mortality by 18-25% in high-burden SSA settings",
+          "causal_link": "LLIN → fewer malaria infections → lower child mortality",
+          "confidence": "high",
+          "evidence_type": "rct"
+        }
+      ],
+      "science_assumptions": [
+        {
+          "assumption_id": "sci-01",
+          "question": "Is pyrethroid resistance undermining LLIN efficacy in the target geographies?",
+          "rationale": "Widespread kdr mutations in Anopheles across West Africa may reduce bednet effectiveness"
+        }
+      ]
+    },
+    {
+      "scope_id": "mock-scope-02",
+      "inv_id": "INV-002",
+      "bow_id": "BOW-Malaria-SMC",
+      "program": "MOCK",
+      "label": "Seasonal malaria chemoprevention scale-up in Sahel",
+      "causal_type": "direct",
+      "evidence_status": "strong",
+      "investments": [
+        {
+          "inv_id": "INV-002",
+          "grantee": "Mock SMC Alliance",
+          "amount_usd": 8500000,
+          "start_date": "2022-07-01",
+          "end_date": "2025-06-30"
+        }
+      ],
+      "causal_claims": [
+        {
+          "claim_id": "claim-02",
+          "claim": "SMC with SP+AQ provides 75% protective efficacy against malaria in children under 5 during the transmission season",
+          "causal_link": "SMC → chemoprophylaxis → prevention of malaria episodes",
+          "confidence": "very_high",
+          "evidence_type": "rct"
+        }
+      ],
+      "science_assumptions": [
+        {
+          "assumption_id": "sci-02",
+          "question": "Is SP+AQ resistance emerging at rates that threaten long-term SMC effectiveness?",
+          "rationale": "Molecular markers of resistance (dhps/dhfr mutations) are increasing in Sahel countries"
+        }
+      ]
+    }
+  ],
+  "scope_timelines": {
+    "mock-scope-01": {
+      "scope_id": "mock-scope-01",
+      "inv_id": "INV-001",
+      "start": "2023-01-01",
+      "end": "2026-12-31",
+      "status": "active",
+      "amounts": [
+        {"year": 2023, "amount_usd": 3000000},
+        {"year": 2024, "amount_usd": 4000000},
+        {"year": 2025, "amount_usd": 3500000},
+        {"year": 2026, "amount_usd": 1500000}
+      ]
+    },
+    "mock-scope-02": {
+      "scope_id": "mock-scope-02",
+      "inv_id": "INV-002",
+      "start": "2022-07-01",
+      "end": "2025-06-30",
+      "status": "active",
+      "amounts": [
+        {"year": 2022, "amount_usd": 2000000},
+        {"year": 2023, "amount_usd": 3500000},
+        {"year": 2024, "amount_usd": 3000000}
+      ]
+    }
+  },
+  "research_model": "claude-sonnet-4-6",
+  "synthesis_model": "claude-sonnet-4-6",
+  "cache_dir": "/Users/ozgurozmen/qpr-collections/MOCK-output/cache",
+  "evidence_packs": [],
+  "link_assessments": [],
+  "science_results": [],
+  "scope_decisions": [],
+  "scope_outputs": [],
+  "asta_traces": [],
+  "slr_traces": [],
+  "lbd_traces": [],
+  "deep_web_traces": [],
+  "edison_traces": [],
+  "web_search_traces": [],
+  "compute_traces": [],
+  "collection_search_traces": [],
+  "investigation_traces": [],
+  "errors": []
+}

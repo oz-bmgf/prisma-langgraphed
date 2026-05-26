@@ -1,0 +1,19 @@
+{
+  "_comment": "Entry state for the gs_verifier graph. Simulates starting a re-verification run against an existing gold standard file. The load_gold node will populate gold_data, doc_list, and investment_scoring from the paths provided.",
+  "program": "MOCK",
+  "gold_path": "/Users/ozgurozmen/qpr-collections/MOCK-ingested/gold_standard_verified.json",
+  "out_path": "/Users/ozgurozmen/qpr-collections/MOCK-output/gold_v3_reverified.json",
+  "as_of_date": "2026-05-24",
+  "verifier_a_model": "claude-opus-4-7",
+  "verifier_b_model": "claude-sonnet-4-6",
+  "skip_causal": false,
+  "gold_data": null,
+  "doc_list": null,
+  "investment_scoring": null,
+  "verdicts": [],
+  "reconciled_path": null,
+  "tiered_gold_dir": null,
+  "gold_v4_path": null,
+  "status_counts": null,
+  "errors": []
+}

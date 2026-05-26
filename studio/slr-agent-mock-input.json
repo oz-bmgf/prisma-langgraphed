@@ -1,0 +1,71 @@
+{
+  "_comment": "Mid-call state for slr_agent. Simulates entry after slr_fetch_source has already returned papers from both sources (openalex_results and asta_results populated). The next node slr_collect_papers will deduplicate, then slr_synthesise will run.",
+  "task_id": "rp-001",
+  "query": "RCT evidence for insecticide-treated bednets reducing under-5 malaria mortality in sub-Saharan Africa",
+  "context": "Malaria program reviewing LLIN distribution investments. Focus on under-5 mortality outcomes in high-burden SSA countries 2019–2024.",
+  "top_k": 20,
+  "openalex_results": [
+    {
+      "title": "Insecticide-treated nets for preventing malaria",
+      "authors": "Lengeler C",
+      "year": "2004",
+      "abstract": "Cochrane review of 22 RCTs. ITNs reduced child mortality by 18% and uncomplicated episodes of P. falciparum malaria by 50% in areas of stable transmission.",
+      "doi": "10.1002/14651858.CD000363.pub2",
+      "source": "openalex"
+    },
+    {
+      "title": "Long-lasting insecticidal nets for preventing malaria in children",
+      "authors": "Pryce J et al.",
+      "year": "2022",
+      "abstract": "Updated Cochrane review. LLINs reduced malaria incidence by 40–50% and all-cause child mortality by 18% vs no nets across 25 RCTs.",
+      "doi": "10.1002/14651858.CD011138.pub3",
+      "source": "openalex"
+    }
+  ],
+  "asta_results": [
+    {
+      "title": "Efficacy of pyrethroid-PBO nets in areas with pyrethroid-resistant malaria vectors",
+      "authors": "Protopopoff N et al.",
+      "year": "2018",
+      "abstract": "Cluster RCT in Tanzania. PBO nets reduced malaria prevalence by 44% compared to conventional pyrethroid nets (RR 0.56, 95% CI 0.41–0.77).",
+      "doi": "10.1016/S0140-6736(18)30499-8",
+      "source": "asta"
+    },
+    {
+      "title": "Effectiveness of Olyset Plus, a permethrin+PBO LLIN, against malaria in Tanzania",
+      "authors": "Temu EA et al.",
+      "year": "2019",
+      "abstract": "Phase III trial confirming PBO LLINs superiority in pyrethroid-resistant settings, with 29% reduction in malaria incidence vs standard LLINs.",
+      "doi": "10.1186/s12936-019-2768-6",
+      "source": "asta"
+    }
+  ],
+  "synthesis": null,
+  "source_count": 0,
+  "search_strategy": "",
+  "tool_traces": [
+    {
+      "tool_name": "search_openalex",
+      "called_at": "2026-05-24T08:00:00Z",
+      "duration_ms": 1240,
+      "success": true,
+      "result_count": 2
+    },
+    {
+      "tool_name": "search_asta",
+      "called_at": "2026-05-24T08:00:01Z",
+      "duration_ms": 980,
+      "success": true,
+      "result_count": 2
+    }
+  ],
+  "result": null,
+  "success": false,
+  "error_message": null,
+  "errors": [],
+  "expanded_queries": [
+    "LLIN randomized controlled trial child mortality Africa",
+    "long-lasting insecticidal net effectiveness sub-Saharan Africa under-five",
+    "bednet malaria prevention efficacy meta-analysis"
+  ]
+}
