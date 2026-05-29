@@ -116,12 +116,30 @@ class _SearchBackendToolsBridge:
         self.compute = compute_fn
 
 
-def _get_tools(config: Any) -> Any:
-    """Wrap config's search_backend in _SearchBackendToolsBridge, or return None."""
+def _get_tools(config: Any, state: Any = None) -> Any:
+    """Wrap config's search_backend in _SearchBackendToolsBridge, or return None.
+
+    Falls back to building a backend from state.ingested_dir + state.collection_name
+    when search_backend is absent from configurable (e.g. LangGraph Studio runs where
+    the caller only supplies initial state and no configurable).
+    """
     configurable = ((config or {}).get("configurable") or {})
     backend = configurable.get("search_backend")
     if not backend:
-        return None
+        ingested_dir = configurable.get("ingested_dir") or (state or {}).get("ingested_dir", "")
+        collection_name = configurable.get("collection_name") or (state or {}).get("collection_name", "")
+        if ingested_dir and collection_name:
+            try:
+                from src.backends.factory import build_search_backend
+                backend = build_search_backend(ingested_dir, collection_name)
+                logger.info(
+                    "_get_tools: built search backend from state (ingested_dir=%s)", ingested_dir
+                )
+            except Exception as exc:
+                logger.warning("_get_tools: could not build search backend: %s", exc)
+                return None
+        else:
+            return None
     return _SearchBackendToolsBridge(
         backend,
         web_search_fn=configurable.get("web_search_fn"),
@@ -141,7 +159,7 @@ def _get_asta_client(config: Any) -> Any:
     if not api_key:
         return None
     try:
-        from src.core.asta_client import AstaClient
+        from src.core.agents.asta import AstaClient
         return AstaClient(api_key=api_key)
     except Exception:
         return None
@@ -215,7 +233,13 @@ async def dispatch_rubric_evaluation(state: CausalState):
         if scope_id in already_done:
             continue
         inv_id = scope.get("inv_id", "")
-        timeline = state.get("scope_timelines", {}).get(scope_id, {})
+        scope_tl = state.get("scope_timelines", {}).get(scope_id, {})
+        # Consumers (build_evidence_pack, _classify_scope_fit, compute_investment_facts)
+        # expect an InvestmentTimeline dict (has title/org/scoring), not a ScopeTimeline.
+        timeline = next(
+            (inv for inv in (scope_tl.get("investments") or []) if inv.get("inv_id") == inv_id),
+            scope_tl,  # fallback keeps backward compat when investments list is absent
+        )
         sends.append(Send("evaluate_investment_rubric", {
             "inv_id": inv_id,
             "scope_id": scope_id,
@@ -223,6 +247,8 @@ async def dispatch_rubric_evaluation(state: CausalState):
             "timeline": timeline,
             "result": None,
             "research_model": research_model,
+            "ingested_dir": state.get("ingested_dir", ""),
+            "collection_name": state.get("collection_name", ""),
         }))
     return sends or "collect_evidence_packs"
 
@@ -246,7 +272,7 @@ async def evaluate_investment_rubric(state: InvestmentRubricState, config: Runna
             inv_id=inv_id,
             scope_id=scope_id,
             timeline=timeline_dict,
-            tools=_get_tools(config),
+            tools=_get_tools(config, state),
             model=state.get("research_model", ""),
         )
         result_dict: dict = result.to_dict() if hasattr(result, "to_dict") else result
@@ -502,9 +528,12 @@ async def _route_link_investigations(state: CausalState):
                 "inv_id": inv_id,
                 "bow_id": bow_id,
                 "scope_id": scope_id,
+                "scope_label": scope.get("label", scope_id),
                 "claim": link,
                 "model": model,
                 "result": None,
+                "ingested_dir": state.get("ingested_dir", ""),
+                "collection_name": state.get("collection_name", ""),
             }))
 
     return sends or "collect_link_assessments"
@@ -527,7 +556,6 @@ async def investigate_link(state: LinkInvestigationState, config: RunnableConfig
             scope_id=scope_id,
             claim=state.get("claim", {}),
             model=state.get("model", ""),
-            tools=_get_tools(config),
             config=config,
         )
         result_dict: dict = result.to_dict() if hasattr(result, "to_dict") else result
@@ -567,11 +595,21 @@ async def investigate_link(state: LinkInvestigationState, config: RunnableConfig
         "iterations_used": result_dict.get("iterations_used", result_dict.get("iterations", result_dict.get("iteration_count", 0))),
     }
 
-    # Collect annotated excerpts; keep top-10 by credibility_tier to bound state size
-    annotated_excerpts = result_dict.pop("annotated_excerpts", []) or []
-    _tier_rank = {"high": 0, "medium": 1, "low": 2}
-    annotated_excerpts.sort(key=lambda x: _tier_rank.get(str(x.get("credibility_tier", "")).lower(), 3))
-    annotated_excerpts = annotated_excerpts[:10]
+    # Collect annotated excerpts — copy, then strip from link_assessments to
+    # bound state size.  Keep top-10 by tier priority.
+    # Correct sort keys match what investigation.py writes: "tier1_primary" < "tier2_secondary" < "tier3_context".
+    raw_excerpts: list[dict] = list(result_dict.get("annotated_excerpts", []) or [])
+    result_dict.pop("annotated_excerpts", None)   # remove from link_assessments to keep state small
+    _tier_rank = {"tier1_primary": 0, "tier2_secondary": 1, "tier3_context": 2}
+    raw_excerpts.sort(key=lambda x: _tier_rank.get(str(x.get("credibility_tier", "")), 3))
+
+    # Enrich with scope_label and link_name — context available only at this node level
+    scope_label: str = state.get("scope_label", scope_id)
+    link_name: str = (state.get("claim") or {}).get("name", link_id)
+    annotated_excerpts = [
+        {**ex, "scope_label": scope_label, "link_name": link_name}
+        for ex in raw_excerpts[:10]
+    ]
 
     return {
         "link_assessments": [result_dict],
@@ -747,6 +785,8 @@ async def _route_science_investigations(state: CausalState):
                 "question": assumption.get("assumption", ""),
                 "result": None,
                 "research_model": research_model,
+                "ingested_dir": state.get("ingested_dir", ""),
+                "collection_name": state.get("collection_name", ""),
             }))
 
     return sends or "collect_science_results"
@@ -768,8 +808,7 @@ async def investigate_science_assumption(state: ScienceAssumptionState, config: 
             bow_id=state["bow_id"],
             scope_id=scope_id,
             question=state.get("question", ""),
-            tools=_get_tools(config),
-            asta_client=_get_asta_client(config),
+            config=config,
             model=state.get("research_model", ""),
         )
         result_dict: dict = result.to_dict() if hasattr(result, "to_dict") else result

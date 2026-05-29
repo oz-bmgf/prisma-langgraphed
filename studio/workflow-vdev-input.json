@@ -1,0 +1,11 @@
+{
+  "program": "VDEV",
+  "run_name": "studio-01",
+  "collection_name": "vdev",
+  "base_dir": "/Users/ozgurozmen/qpr-collections",
+  "ingested_dir": "/Users/ozgurozmen/qpr-collections/VDEV-ingested",
+  "research_model": "claude-sonnet-4-6",
+  "synthesis_model": "claude-sonnet-4-6",
+  "research_plan_approved": true,
+  "report_approved": true
+}

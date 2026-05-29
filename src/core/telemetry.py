@@ -1,6 +1,6 @@
 """OpenTelemetry setup for NQPR pipeline observability.
 
-The canonical initializer is `src.observability.init_tracing` — call that once
+The canonical initializer is `observability.tracing.init_tracing` — call that once
 at process startup. `setup_telemetry()` here delegates to it for backward
 compatibility with any existing callers.
 
@@ -17,7 +17,7 @@ def setup_telemetry(service_name: str = "nqpr-pipeline") -> None:
     applied via the OTEL_SERVICE_NAME env var if not already set."""
     import os
     os.environ.setdefault("OTEL_SERVICE_NAME", service_name)
-    from src.observability import init_tracing
+    from observability.tracing import init_tracing
     init_tracing()
 
 

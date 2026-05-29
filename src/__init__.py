@@ -1,3 +1,3 @@
-from src.observability import init_tracing
+from observability.tracing import init_tracing
 
 init_tracing()

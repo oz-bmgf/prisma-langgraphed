@@ -1,0 +1,61 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512        # raised from 256 — NQPR investigation loops produce many spans quickly
+    spike_limit_mib: 128  # allowed surge above limit before refusing; prevents RESOURCE_EXHAUSTED
+
+  batch:
+    send_batch_size: 256
+    send_batch_max_size: 512
+    timeout: 5s           # flush every 5 s (was 10 s) to drain the queue faster
+
+exporters:
+{% if phoenix_enabled %}
+  otlphttp/phoenix:
+    endpoint: "{{ phoenix_endpoint }}"
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 60s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 1000
+{% endif %}
+{% if langfuse_enabled %}
+  otlphttp/langfuse:
+    endpoint: "{{ langfuse_endpoint }}"
+    headers:
+      Authorization: "Basic {{ langfuse_auth_header }}"
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 60s
+      max_elapsed_time: 300s
+    sending_queue:
+      enabled: true
+      num_consumers: 2
+      queue_size: 1000
+{% endif %}
+
+service:
+  pipelines:
+    traces:
+      receivers:  [otlp]
+      processors: [memory_limiter, batch]
+      exporters:
+{% if phoenix_enabled %}
+        - otlphttp/phoenix
+{% endif %}
+{% if langfuse_enabled %}
+        - otlphttp/langfuse
+{% endif %}

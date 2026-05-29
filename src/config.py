@@ -116,6 +116,8 @@ LBD_TIMEOUT_SECONDS: int = int(os.getenv("NQPR_LBD_TIMEOUT", "600"))
 
 ASTA_API_KEY: str = os.getenv("ASTA_API_KEY", "")
 ASTA_ENDPOINT: str = os.getenv("ASTA_ENDPOINT", "https://asta-tools.allen.ai/mcp/v1")
+ASTA_TIMEOUT_SECONDS: int = int(os.getenv("ASTA_TIMEOUT", "90"))
+SEMANTIC_SCHOLAR_API_KEY: str = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
 
 # ── OpenAlex ──────────────────────────────────────────────────────────────────
 

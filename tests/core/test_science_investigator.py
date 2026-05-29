@@ -82,7 +82,7 @@ async def test_asta_gate_blocks_early_evidence_gathered():
                 next_actions=[],
             )
 
-    with patch("src.core.science_investigator.acall_llm", new=mock_llm):
+    with patch("src.core.science_investigator.acall_structured", new=mock_llm):
         result = await investigate_science_question(
             assumption_id="A-001",
             inv_id="INV-001",
@@ -98,11 +98,8 @@ async def test_asta_gate_blocks_early_evidence_gathered():
 
 async def test_asta_soft_cap_skips_excess_calls():
     """ASTA actions beyond soft cap are silently skipped."""
-    from unittest.mock import MagicMock
     from src.config import ASTA_SOFT_CAP
 
-    mock_asta = MagicMock()
-    mock_asta.search = AsyncMock(return_value=[{"title": "Paper", "abstract": "text", "paperId": "P1"}])
     call_count = 0
 
     async def mock_llm(*args, **kwargs):
@@ -115,14 +112,18 @@ async def test_asta_soft_cap_skips_excess_calls():
             )
         return ScienceActionsOutput(status="evidence_gathered", answer="Done.", next_actions=[])
 
-    with patch("src.core.science_investigator.acall_llm", new=mock_llm):
+    from unittest.mock import MagicMock
+    mock_search_asta = MagicMock()
+    mock_search_asta.ainvoke = AsyncMock(return_value="Paper title. Abstract text.")
+
+    with patch("src.core.science_investigator.acall_structured", new=mock_llm), \
+         patch("src.core.science_investigator.search_asta", new=mock_search_asta):
         result = await investigate_science_question(
             assumption_id="A-002",
             inv_id="INV-002",
             bow_id="B002",
             scope_id="S-02",
             question="Does the treatment work?",
-            asta_client=mock_asta,
             model="claude-haiku-4-5-20251001",
         )
 
@@ -136,7 +137,7 @@ async def test_consecutive_empty_forces_insufficient_evidence():
         next_actions=[ScienceAction(tool="search_investment", query="test")],
     ))
 
-    with patch("src.core.science_investigator.acall_llm", new=mock_llm), \
+    with patch("src.core.science_investigator.acall_structured", new=mock_llm), \
          patch("src.core.science_investigator._execute_actions", new=AsyncMock(return_value=([], 0))):
         result = await investigate_science_question(
             assumption_id="A-003",
@@ -157,7 +158,7 @@ async def test_investigate_science_returns_result_with_to_dict():
         next_actions=[],
     ))
 
-    with patch("src.core.science_investigator.acall_llm", new=mock_llm):
+    with patch("src.core.science_investigator.acall_structured", new=mock_llm):
         result = await investigate_science_question(
             assumption_id="A-004",
             inv_id="INV-004",
@@ -196,7 +197,7 @@ async def test_asta_client_called_for_search_asta_action():
             next_actions=[],
         )
 
-    with patch("src.core.science_investigator.acall_llm", new=mock_llm):
+    with patch("src.core.science_investigator.acall_structured", new=mock_llm):
         result = await investigate_science_question(
             assumption_id="A-005",
             inv_id="INV-005",
@@ -218,7 +219,7 @@ async def test_no_asta_client_does_not_crash():
         next_actions=[],
     ))
 
-    with patch("src.core.science_investigator.acall_llm", new=mock_llm):
+    with patch("src.core.science_investigator.acall_structured", new=mock_llm):
         result = await investigate_science_question(
             assumption_id="A-006",
             inv_id="INV-006",

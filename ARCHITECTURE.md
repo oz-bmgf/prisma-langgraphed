@@ -1387,40 +1387,98 @@ markdown → HTML (python-markdown + optimized tables) → PDF (weasyprint A4)
 
 ## 15. Observability
 
-### Fan-out architecture
+### Collector architecture
+
+The app sends all spans via a single gRPC `BatchSpanProcessor` to a local
+`otel-collector` sidecar (Docker service), which fans them out to Phoenix and
+Langfuse.  LangSmith stays on its own native `LANGCHAIN_TRACING_V2` SDK path
+and is never routed through the collector.
 
 ```
-Graph process
+Application process
     │
-    │  OTEL SDK → grpc:4317
-    ▼
-OTEL Collector  (otel-collector container)
-    │
-    ├──► LangSmith  (https://api.smith.langchain.com/otel)
-    └──► Langfuse   (http://langfuse-server:3000/api/public/otel)
+    └──► BatchSpanProcessor ──► OTLPSpanExporter (gRPC) ──► otel-collector:4317
+           (background thread)                               (Docker service)
+                                                                     │
+                                                               ┌─────┴─────┐
+                                                               ▼           ▼
+                                                           Phoenix     Langfuse
+                                 (when PHOENIX_TRACING_ENABLED=true in .env)
+                                 (when LANGFUSE_TRACING_ENABLED=true in .env)
+
+LangSmith ◄──── LANGCHAIN_TRACING_V2 native SDK (direct, no collector)
 ```
 
-The graph emits **one** OTEL stream. The collector multiplexes it to both backends. Adding a third destination (Honeycomb, Jaeger, etc.) requires only a collector config change — no application code changes.
+`SimpleSpanProcessor` is never used — it exports synchronously on the calling
+thread and would stall LangGraph nodes.
+
+The collector config is **generated at container startup** from
+`otel/collector.config.yaml.j2` by `otel/generate_config.py` (the container
+entrypoint).  This is necessary because the OTEL Collector YAML format does not
+support conditional pipeline entries natively — Jinja2 conditionals produce
+the correct `exporters:` and `service.pipelines.traces.exporters:` lists
+based on the env vars.
+
+**To toggle a backend or change an endpoint:**
+1. Edit `.env` (`PHOENIX_TRACING_ENABLED`, `PHOENIX_ENDPOINT`, etc.)
+2. Rebuild and restart the collector:
+   ```bash
+   docker compose build otel-collector
+   docker compose up -d otel-collector
+   ```
 
 ### Initialization
 
-`src/observability.py` exposes `init_tracing()`, called once at process startup in `main.py` before the graph is compiled. It is idempotent (safe to call multiple times) and fails silently when the collector endpoint is unreachable.
+`observability.tracing.init_tracing()` is called once at process startup in
+`main.py` before the graph is compiled.  It is idempotent and fails silently
+when the collector is unreachable — the graph always starts regardless
+of observability infrastructure.
 
-`LangchainInstrumentor` is activated inside `init_tracing()`. It auto-instruments every LangChain/LangGraph call — all `acall_llm` invocations, `ChatAnthropic`, `ChatOpenAI`, and the Responses API path in `deep_web.py` are captured as OTEL spans automatically. **No per-node instrumentation code is required.**
+`LangChainInstrumentor` is activated inside `init_tracing()`. It auto-instruments
+every LangChain/LangGraph call — all `acall_llm` invocations, `ChatAnthropic`,
+`ChatOpenAI`, and the Responses API path in `deep_web.py` are captured as OTEL
+spans automatically. **No per-node instrumentation code is required.**
 
-`RunnableConfig` threading through every node (already in place) is what causes LangChain to attach LLM spans as children of their parent node span. Without `config` passed through, every LLM call appears as a root-level orphan span.
+`RunnableConfig` threading through every node causes LangChain to attach LLM
+spans as children of their parent node span. Without `config` passed through,
+every LLM call appears as a root-level orphan span.
+
+Graceful shutdown: `init_tracing()` registers an `atexit` handler that calls
+`force_flush(timeout_millis=5000)` then `shutdown()`, ensuring in-flight spans
+reach the collector before the process exits.
 
 ### Environment variables
 
+**App-side** (read by `observability/tracing.py`)
+
 | Variable | Default | Purpose |
 |---|---|---|
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | Collector gRPC endpoint |
+| `TRACING_ENABLED` | `true` | Set `false` to register `NoOpTracerProvider` and skip all OTEL |
+| `OTEL_SDK_DISABLED` | — | Legacy kill-switch; same effect as `TRACING_ENABLED=false` |
 | `OTEL_SERVICE_NAME` | `prisma-langgraphed` | Service name tag on all spans |
-| `OTEL_SDK_DISABLED` | — | Set to `true` to disable tracing (used in CI/tests) |
-| `LANGSMITH_API_KEY` | — | Forwarded by the collector to LangSmith |
-| `LANGFUSE_OTEL_BASIC_AUTH` | — | `base64(pk-lf-xxx:sk-lf-xxx)` for Langfuse |
-| `LANGFUSE_NEXTAUTH_SECRET` | — | Langfuse auth secret (`openssl rand -base64 32`) |
-| `LANGFUSE_SALT` | — | Langfuse salt (`openssl rand -base64 32`) |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | gRPC endpoint for local collector |
+| `OTEL_BSP_MAX_QUEUE_SIZE` | `2048` | Max spans buffered before dropping |
+| `OTEL_BSP_SCHEDULE_DELAY_MILLIS` | `5000` | Export interval (ms) |
+| `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | `512` | Spans per export request |
+| `OTEL_BSP_EXPORT_TIMEOUT_MILLIS` | `30000` | Per-request timeout (ms) |
+
+**Collector-side** (read by `otel/generate_config.py` at container startup)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PHOENIX_TRACING_ENABLED` | `true` | Include Phoenix exporter in collector pipeline |
+| `PHOENIX_ENDPOINT` | — | Full OTLP/HTTP endpoint for Phoenix (e.g. `http://host:6006/v1/traces`) |
+| `LANGFUSE_TRACING_ENABLED` | `true` | Include Langfuse exporter in collector pipeline |
+| `LANGFUSE_ENDPOINT` | — | Full OTLP/HTTP endpoint for Langfuse |
+| `LANGFUSE_PUBLIC_KEY` | — | Used to build Basic auth header in the collector |
+| `LANGFUSE_SECRET_KEY` | — | Used to build Basic auth header in the collector |
+
+**LangSmith** (native SDK — do not route through collector)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LANGSMITH_API_KEY` | — | LangSmith API key (also `LANGCHAIN_API_KEY`) |
+| `LANGCHAIN_TRACING_V2` | — | Enables the LangChain native SDK integration |
 
 ### UI access
 
@@ -1428,20 +1486,25 @@ The graph emits **one** OTEL stream. The collector multiplexes it to both backen
 |---|---|---|
 | LangSmith | `https://smith.langchain.com` → project `prisma-langgraphed` | Cloud-hosted; requires `LANGSMITH_API_KEY` |
 | Langfuse | `http://localhost:3000` (Docker) | Self-hosted; spin up with `docker compose up langfuse-server langfuse-worker postgres` |
+| Phoenix | `PHOENIX_ENDPOINT` host | Self-hosted; requires `PHOENIX_ENDPOINT` set in `.env` |
 
 ### Local dev without Docker
 
-The graph can emit traces locally without running the full Docker stack:
+For local dev the collector is not running, so either point
+`OTEL_EXPORTER_OTLP_ENDPOINT` at a standalone collector process or disable
+tracing entirely:
 
 ```bash
-# Start only the collector and Langfuse (no graph container)
-docker compose up otel-collector langfuse-server langfuse-worker postgres
+# No tracing at all (CI mode)
+TRACING_ENABLED=false langgraph dev
 
-# Run the graph locally with live tracing
+# Langfuse only: start the full stack including the collector
+docker compose up -d
 source .env && langgraph dev
 ```
 
-`docker compose up graph postgres` still works without the observability stack — `init_tracing()` fails silently when the collector is unreachable.
+If neither backend is enabled in `.env`, the collector starts with an empty
+exporters list and emits a warning — it does not crash.
 
 ### Calls not auto-instrumented
 

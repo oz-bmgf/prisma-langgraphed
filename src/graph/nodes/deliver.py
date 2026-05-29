@@ -102,14 +102,34 @@ async def deliver(state: WorkflowState, config: RunnableConfig) -> dict:
             delivered.append(str(wr_dst))
 
     # ── excerpts.csv ──────────────────────────────────────────────────────────
+    # Schema matches the old 13-column format expected by evidence_audit and narration_tools.
+    # Excerpt dicts carry both old-schema keys (excerpt_id, quote, source_file, ...) and
+    # new pipeline keys (text, source, credibility_tier) — old keys are used for the CSV,
+    # new keys are available for in-memory consumers.
     all_excerpts: list[dict] = state.get("all_excerpts") or []  # type: ignore[assignment]
     if all_excerpts:
         excerpts_dst = delivery_dir / "excerpts.csv"
-        fieldnames = ["inv_id", "scope_id", "link_id", "text", "source", "page",
-                      "significance", "numerical_facts", "credibility_tier"]
-        # Normalise numerical_facts to string
+        fieldnames = [
+            "excerpt_id", "scope_id", "scope_label", "inv_id", "link_name",
+            "source_file", "page", "source_type", "type", "quote",
+            "significance", "context_needed", "numerical_facts",
+        ]
         normalised = [
-            {**ex, "numerical_facts": ", ".join(str(n) for n in (ex.get("numerical_facts") or []))}
+            {
+                **ex,
+                # Flatten numerical_facts list to semicolon-joined string for CSV
+                "numerical_facts": " ; ".join(str(n) for n in (ex.get("numerical_facts") or [])),
+                # Ensure boolean fields serialise as strings
+                "context_needed": str(ex.get("context_needed", "")),
+                # Fall back to new-schema keys when old-schema keys are absent
+                "excerpt_id": ex.get("excerpt_id") or "",
+                "scope_label": ex.get("scope_label") or ex.get("scope_id", ""),
+                "link_name": ex.get("link_name") or ex.get("link_id", ""),
+                "source_file": ex.get("source_file") or ex.get("source", ""),
+                "source_type": ex.get("source_type", ""),
+                "type": ex.get("type", ""),
+                "quote": ex.get("quote") or ex.get("text", ""),
+            }
             for ex in all_excerpts
         ]
         try:

@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
-from src.graph.agents.lbd_graph import (
+from src.graph.subgraphs.lbd import (
     _parse_concepts,
     _parse_papers_from_content,
     _route_lbd,

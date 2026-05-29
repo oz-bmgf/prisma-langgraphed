@@ -141,6 +141,9 @@ class InvestmentTimeline:
     latest_doc_date: str = ""
     months_since_latest: int = 0
 
+    # Raw scoring record (preserved for compute_investment_facts)
+    scoring: dict = field(default_factory=dict)
+
     # LLM-generated (Phase 2.6)
     narrative: str = ""
     key_events: list[dict] = field(default_factory=list)
@@ -260,6 +263,7 @@ def build_investment_timeline(
     timeline = InvestmentTimeline(inv_id=inv_id)
 
     if scoring_data:
+        timeline.scoring = scoring_data
         timeline.org = scoring_data.get("org", "")
         timeline.title = scoring_data.get("title", "")
         timeline.bow_id = scoring_data.get("bow_id", "")
@@ -490,6 +494,10 @@ You are a program analyst writing a scope-level synthesis (200-400 words) connec
 multiple investments. Explain how they relate, shared dependencies, timeline overlaps, \
 and the overall trajectory of this body of work. Do NOT wrap in JSON."""
 
+# Public aliases — used by analyze.py graph nodes (phase 2.6 Send fan-out)
+INVESTMENT_NARRATIVE_SYSTEM = _INVESTMENT_NARRATIVE_SYSTEM
+SCOPE_SYNTHESIS_SYSTEM = _SCOPE_SYNTHESIS_SYSTEM
+
 
 async def _build_single_investment_narrative(
     inv: InvestmentTimeline,
@@ -550,8 +558,8 @@ async def build_timeline_narratives_async(
     if not scope_timeline.investments:
         return
 
-    # asyncio-APPROVED-2: concurrent LLM — one narrative per investment, inside core library called
-    # via asyncio.to_thread; not convertible to Send() without restructuring the library API.
+    # asyncio-APPROVED-2: concurrent LLM — used only in tests/standalone contexts.
+    # The analyze subgraph uses Send() fan-out (generate_investment_narrative) instead.
     results = await asyncio.gather(
         *[
             _build_single_investment_narrative(

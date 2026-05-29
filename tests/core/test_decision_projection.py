@@ -238,7 +238,7 @@ async def test_project_decisions_returns_dict_with_scope_id():
             )
         ]
     )
-    with patch("src.core.decision_projection.acall_llm", new=AsyncMock(return_value=mock_output)):
+    with patch("src.core.decision_projection.acall_structured", new=AsyncMock(return_value=mock_output)):
         result = await project_decisions(
             "S-01",
             {"inv_id": "INV-001", "link_assessments": [], "science_flags": []},
@@ -264,7 +264,7 @@ async def test_project_decisions_section1a_gate_drops_low_evidence():
             )
         ]
     )
-    with patch("src.core.decision_projection.acall_llm", new=AsyncMock(return_value=mock_output)):
+    with patch("src.core.decision_projection.acall_structured", new=AsyncMock(return_value=mock_output)):
         result = await project_decisions(
             "S-02",
             {"inv_id": "INV-002", "link_assessments": [], "science_flags": []},
@@ -274,7 +274,7 @@ async def test_project_decisions_section1a_gate_drops_low_evidence():
 
 
 async def test_project_decisions_handles_llm_failure():
-    with patch("src.core.decision_projection.acall_llm", new=AsyncMock(side_effect=RuntimeError("down"))):
+    with patch("src.core.decision_projection.acall_structured", new=AsyncMock(side_effect=RuntimeError("down"))):
         result = await project_decisions(
             "S-03",
             {"inv_id": "INV-003"},

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from unittest.mock import AsyncMock, patch
 
-from src.graph.agents.edison_graph import (
+from src.graph.subgraphs.edison import (
     edison_graph,
     route_rewrite_entry,
     edison_rewrite_query,

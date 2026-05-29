@@ -159,23 +159,33 @@ services:
       minio-init:
         condition: service_completed_successfully
 
-  # ── OpenTelemetry Collector ──────────────────────────────────────────────────
+  # ── OTEL Collector ───────────────────────────────────────────────────────────
+  # Receives spans from the graph process (gRPC :4317 / HTTP :4318) and fans them
+  # out to Phoenix and Langfuse.  Config is generated at startup from
+  # otel/collector.config.yaml.j2 by otel/generate_config.py, driven by
+  # PHOENIX_TRACING_ENABLED, LANGFUSE_TRACING_ENABLED, and related env vars.
+  # After changing .env toggles, rebuild with: docker compose build otel-collector
 
   otel-collector:
-    image: otel/opentelemetry-collector-contrib:latest
-    command: ["--config=/etc/otel/collector-config.yaml"]
-    volumes:
-      - ./otel/collector-config.yaml:/etc/otel/collector-config.yaml:ro
+    build:
+      context: ./otel
+      dockerfile: Dockerfile
+    env_file:
+      - .env
     ports:
-      - "4317:4317"   # gRPC
-      - "4318:4318"   # HTTP
-    environment:
-      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY}
-      LANGFUSE_OTEL_BASIC_AUTH: ${LANGFUSE_OTEL_BASIC_AUTH}
-    depends_on:
-      - langfuse-server
+      - "4317:4317"   # gRPC  — app connects here
+      - "4318:4318"   # HTTP  — optional / debug
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:13133/"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
 
   # ── Graph process ────────────────────────────────────────────────────────────
+  # Tracing flows to the local otel-collector via a single gRPC BatchSpanProcessor.
+  # The collector fans out to Phoenix and Langfuse based on PHOENIX_*/LANGFUSE_*
+  # env vars.  LangSmith remains on the native LANGCHAIN_TRACING_V2 SDK path.
 
   graph:
     build: .
@@ -187,13 +197,13 @@ services:
       NQPR_CHECKPOINTER_BACKEND: postgres
       NQPR_CHECKPOINT_POSTGRES_DSN: postgresql://langgraph:langgraph@postgres:5432/langgraph
       DATABASE_URL: postgresql://langgraph:langgraph@postgres:5432/langgraph
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
       OTEL_SERVICE_NAME: prisma-langgraphed
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
     depends_on:
       postgres:
         condition: service_healthy
       otel-collector:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - .:/app
 

@@ -26,7 +26,7 @@ from src.config import (
     TOP_K_DEFAULT,
 )
 from src.core.evidence_model import InvestmentEvidencePack
-from src.core.llm_utils import acall_llm
+from src.core.llm_utils import acall_llm, acall_structured
 from src.core.output_schemas import StrategyQueryList
 
 logger = logging.getLogger(__name__)
@@ -166,11 +166,11 @@ async def _strategy1_llm_queries(
         program_area=program_area or "global health",
     )
     try:
-        result: StrategyQueryList = await acall_llm(
+        result: StrategyQueryList = await acall_structured(
             prompt,
             system_msg="You are a portfolio analyst generating targeted research queries.",
             model=model,
-            output_schema=StrategyQueryList,
+            schema=StrategyQueryList,
             max_tokens=DEFAULT_MAX_TOKENS,
         )
         return [q for q in result.queries if q.strip()][:10]

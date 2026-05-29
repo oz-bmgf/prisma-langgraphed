@@ -9,15 +9,18 @@ from src.graph.subgraphs.analyze import (
     analyze_graph,
     assemble_report,
     build_investment_report_worker,
+    collect_investment_narratives,
     collect_investment_reports,
     collect_scope_sections,
     collect_timeline_narratives,
     compute_scopes,
     cross_cutting_analysis,
+    dispatch_investment_narratives,
     dispatch_investment_reports,
     dispatch_scope_sections,
-    dispatch_timeline_narratives,
-    generate_scope_narrative,
+    dispatch_scope_syntheses,
+    generate_investment_narrative,
+    generate_scope_synthesis,
     load_catalog,
     orientation,
     run_causal_pipeline,
@@ -181,50 +184,131 @@ async def test_compute_scopes_skips_investments_with_no_bows():
 
 
 # ---------------------------------------------------------------------------
-# dispatch_timeline_narratives / generate_scope_narrative / collect_timeline_narratives
+# dispatch_investment_narratives / generate_investment_narrative
+# collect_investment_narratives / dispatch_scope_syntheses / generate_scope_synthesis
+# collect_timeline_narratives
 # ---------------------------------------------------------------------------
 
 
-async def test_dispatch_timeline_narratives_returns_sends():
+async def test_dispatch_investment_narratives_returns_sends_fallback():
+    """With no scope_timelines investments, sends one per scope (fallback financial path)."""
     from langgraph.types import Send
     scopes = [
-        {"scope_id": "scope_0000", "inv_id": "INV-001", "bow_ids": ["BOW-A"]},
-        {"scope_id": "scope_0001", "inv_id": "INV-002", "bow_ids": ["BOW-B"]},
+        {"scope_id": "scope_0000", "inv_id": "INV-001"},
+        {"scope_id": "scope_0001", "inv_id": "INV-002"},
     ]
     state = _base_state(scopes=scopes, investment_scoring=_investment_scoring())
-    sends = await dispatch_timeline_narratives(state)
+    sends = await dispatch_investment_narratives(state)
     assert len(sends) == 2
     assert all(isinstance(s, Send) for s in sends)
-    assert all(s.node == "generate_scope_narrative" for s in sends)
+    assert all(s.node == "generate_investment_narrative" for s in sends)
     scope_ids = {s.arg["scope_id"] for s in sends}
     assert "scope_0000" in scope_ids
     assert "scope_0001" in scope_ids
 
 
-async def test_dispatch_timeline_narratives_empty_scopes():
+async def test_dispatch_investment_narratives_rich_path():
+    """With scope_timelines investments present, sends one Send per investment."""
+    from langgraph.types import Send
+    scopes = [{"scope_id": "scope_0000", "inv_id": "INV-001"}]
+    scope_timelines = {
+        "scope_0000": {
+            "scope_id": "scope_0000",
+            "label": "Scope A",
+            "investments": [
+                {"inv_id": "INV-001", "documents": []},
+                {"inv_id": "INV-001b", "documents": []},
+            ],
+        }
+    }
+    state = _base_state(scopes=scopes, scope_timelines=scope_timelines)
+    sends = await dispatch_investment_narratives(state)
+    assert len(sends) == 2
+    assert all(s.node == "generate_investment_narrative" for s in sends)
+    inv_ids = {s.arg["inv_id"] for s in sends}
+    assert inv_ids == {"INV-001", "INV-001b"}
+
+
+async def test_dispatch_investment_narratives_empty_scopes():
     state = _base_state(scopes=[])
-    result = await dispatch_timeline_narratives(state)
+    result = await dispatch_investment_narratives(state)
+    assert result == "collect_investment_narratives"
+
+
+async def test_generate_investment_narrative_fallback_calls_llm():
+    """Fallback path (no documents key) calls acall_llm for brief financial summary."""
+    from src.graph.state import InvestmentNarrativeState
+    node_state: InvestmentNarrativeState = {
+        "scope_id": "scope_0000",
+        "scope_label": "Scope A",
+        "inv_id": "INV-001",
+        "inv_data": {
+            "inv_id": "INV-001",
+            "start": "2023-01", "end": "2025-12", "status": "active",
+            "approved_amount": 10_000_000, "paid_amount": 6_000_000,
+            # no "documents" key → fallback path
+        },
+        "model": "claude-sonnet-4-6",
+    }
+    mock_acall = AsyncMock(return_value="Financial narrative.")
+    with patch("src.graph.subgraphs.analyze.acall_llm", mock_acall):
+        result = await generate_investment_narrative(node_state)
+
+    mock_acall.assert_called_once()
+    assert result["investment_narrative_results"][0]["narrative"] == "Financial narrative."
+    assert result["investment_narrative_results"][0]["inv_id"] == "INV-001"
+    assert result["investment_narrative_results"][0]["scope_id"] == "scope_0000"
+
+
+async def test_collect_investment_narratives_is_noop():
+    state = _base_state(investment_narrative_results=[
+        {"scope_id": "scope_0000", "inv_id": "INV-001", "narrative": "N1"},
+    ])
+    result = await collect_investment_narratives(state)
+    assert result == {}
+
+
+async def test_dispatch_scope_syntheses_returns_sends():
+    from langgraph.types import Send
+    inv_results = [
+        {"scope_id": "scope_0000", "inv_id": "INV-001", "narrative": "N1", "inv_data": {}},
+        {"scope_id": "scope_0001", "inv_id": "INV-002", "narrative": "N2", "inv_data": {}},
+    ]
+    state = _base_state(investment_narrative_results=inv_results)
+    sends = await dispatch_scope_syntheses(state)
+    assert len(sends) == 2
+    assert all(isinstance(s, Send) for s in sends)
+    assert all(s.node == "generate_scope_synthesis" for s in sends)
+    scope_ids = {s.arg["scope_id"] for s in sends}
+    assert scope_ids == {"scope_0000", "scope_0001"}
+
+
+async def test_dispatch_scope_syntheses_empty_inv_results():
+    state = _base_state(investment_narrative_results=[])
+    result = await dispatch_scope_syntheses(state)
     assert result == "collect_timeline_narratives"
 
 
-async def test_generate_scope_narrative_calls_llm():
-    from src.graph.state import ScopeNarrativeState
-    node_state: ScopeNarrativeState = {
+async def test_generate_scope_synthesis_calls_llm():
+    from src.graph.state import ScopeSynthesisState
+    node_state: ScopeSynthesisState = {
         "scope_id": "scope_0000",
-        "inv_id": "INV-001",
-        "timeline": {"scope_id": "scope_0000", "inv_id": "INV-001",
-                     "start": "2023-01", "end": "2025-12", "status": "active",
-                     "approved_amount": 10_000_000, "paid_amount": 6_000_000},
+        "scope_label": "Scope A",
+        "investment_narratives": [
+            {"scope_id": "scope_0000", "inv_id": "INV-001", "narrative": "Investment N1.", "inv_data": {}},
+        ],
+        "scope_timeline_dict": {"scope_id": "scope_0000", "investments": []},
         "model": "claude-sonnet-4-6",
-        "result": None,
     }
-    mock_acall = AsyncMock(return_value="Timeline narrative.")
+    synthesis_text = "Scope synthesis: both investments share dependencies and overlapping timelines."
+    mock_acall = AsyncMock(return_value=synthesis_text)
     with patch("src.graph.subgraphs.analyze.acall_llm", mock_acall):
-        result = await generate_scope_narrative(node_state)
+        result = await generate_scope_synthesis(node_state)
 
     mock_acall.assert_called_once()
-    assert result["timeline_narrative_results"][0]["narrative"] == "Timeline narrative."
-    assert result["timeline_narrative_results"][0]["inv_id"] == "INV-001"
+    tl = result["timeline_narrative_results"][0]
+    assert tl["scope_id"] == "scope_0000"
+    assert tl["narrative"] == synthesis_text
 
 
 async def test_collect_timeline_narratives_builds_dict():
@@ -593,14 +677,16 @@ def test_analyze_graph_compiles():
 
 
 def test_analyze_graph_has_all_nodes():
-    # dispatch_investment_reports and dispatch_scope_sections are conditional-edge routing
-    # functions, not nodes — same pattern as dispatch_timeline_narratives.
+    # Conditional-edge routers (dispatch_investment_narratives, dispatch_scope_syntheses,
+    # dispatch_investment_reports, dispatch_scope_sections) are functions, not nodes.
     expected = {
         "load_catalog",
         "orientation",
         "compute_scopes",
         "build_timelines",
-        "generate_scope_narrative",
+        "generate_investment_narrative",
+        "collect_investment_narratives",
+        "generate_scope_synthesis",
         "collect_timeline_narratives",
         "run_causal_pipeline",
         "build_investment_report_worker",

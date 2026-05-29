@@ -111,7 +111,7 @@ def test_causal_join_nodes():
 
 def test_slr_graph_has_agent_tool_loop():
     """SLR uses an agent + ToolNode loop (Option B: LLM-driven tool selection)."""
-    from src.graph.agents.slr_graph import slr_graph
+    from src.graph.subgraphs.slr import slr_graph
     nodes = list(slr_graph.nodes.keys())
     assert "slr_agent" in nodes, f"slr_agent not in nodes: {nodes}"
     assert "slr_tools" in nodes, f"slr_tools not in nodes: {nodes}"
@@ -126,7 +126,7 @@ def test_slr_graph_has_agent_tool_loop():
 
 def test_lbd_graph_has_agent_tool_loop():
     """LBD uses an agent + ToolNode loop (Option B: LLM-driven tool selection)."""
-    from src.graph.agents.lbd_graph import lbd_graph
+    from src.graph.subgraphs.lbd import lbd_graph
     nodes = list(lbd_graph.nodes.keys())
     assert "lbd_agent" in nodes, f"lbd_agent not in nodes: {nodes}"
     assert "lbd_tools" in nodes, f"lbd_tools not in nodes: {nodes}"

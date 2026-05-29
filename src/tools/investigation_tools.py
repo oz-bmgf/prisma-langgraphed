@@ -67,8 +67,11 @@ async def search_investment(
         _append = None
 
     configurable = (config or {}).get("configurable", {})
-    backend: SearchBackend = configurable["search_backend"]
+    backend: SearchBackend = configurable.get("search_backend")
+    if backend is None:
+        return "(search_backend not configured)"
     inv_id: Optional[str] = configurable.get("inv_id")
+    bow_id: Optional[str] = configurable.get("bow_id")
     k = top_k if top_k is not None else 25
 
     start = time.monotonic()
@@ -78,6 +81,7 @@ async def search_investment(
         query,
         top_k=k,
         inv_id_filter=inv_id,
+        bow_id_filter=bow_id,
         doc_type_filter=doc_type,
     )
 
@@ -128,7 +132,9 @@ async def search_portfolio(
         _append = None
 
     configurable = (config or {}).get("configurable", {})
-    backend: SearchBackend = configurable["search_backend"]
+    backend: SearchBackend = configurable.get("search_backend")
+    if backend is None:
+        return "(search_backend not configured)"
     k = top_k if top_k is not None else 10
 
     start = time.monotonic()

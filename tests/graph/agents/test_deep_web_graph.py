@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.graph.agents.deep_web_graph import (
+from src.graph.subgraphs.deep_web import (
     deep_web_graph,
     deep_web_route_after_primary,  # combined routing+dispatch conditional edge
     deep_web_try_primary,

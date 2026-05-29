@@ -1,8 +1,8 @@
-"""Top-level NQPR workflow graph (ARCHITECTURE.md §2).
+"""Top-level NQPR workflow graph (analyze pipeline only).
 
 Entry:   START → load_collection
-Exits:   deliver → END  (success)
-         precheck → END (precheck failure)
+Exits:   rerender → deliver → END  (success)
+         precheck → END  (precheck failure)
 
 The graph checkpoints after every node whenever a checkpointer is attached.
 Human-in-the-loop interrupts are OFF by default (pipeline runs unattended).
@@ -25,15 +25,10 @@ from src.config import (
     DEFAULT_SYNTHESIS_MODEL,
 )
 from src.graph.nodes.analyze import analyze
-from src.graph.nodes.approve_report import approve_report
 from src.graph.nodes.deliver import deliver
-from src.graph.nodes.finalize import finalize
 from src.graph.nodes.load_collection import load_collection
 from src.graph.nodes.precheck import precheck
-from src.graph.nodes.prepare_research import prepare_research
 from src.graph.nodes.rerender import rerender
-from src.graph.nodes.research import research
-from src.graph.nodes.review_research_plan import review_research_plan
 from src.graph.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -48,14 +43,6 @@ def route_after_precheck(state: WorkflowState) -> str:
     return "analyze" if state.get("precheck_passed") else END
 
 
-def route_after_research_plan_review(state: WorkflowState) -> str:
-    return "research" if state.get("research_plan_approved") else "prepare_research"
-
-
-def route_after_report_approval(state: WorkflowState) -> str:
-    return "deliver" if state.get("report_approved") else "finalize"
-
-
 # ---------------------------------------------------------------------------
 # Graph builder
 # ---------------------------------------------------------------------------
@@ -66,15 +53,10 @@ _builder = StateGraph(WorkflowState)
 _builder.add_node("load_collection", load_collection)
 _builder.add_node("precheck", precheck)
 _builder.add_node("analyze", analyze)
-_builder.add_node("prepare_research", prepare_research)
-_builder.add_node("review_research_plan", review_research_plan)
-_builder.add_node("research", research)
-_builder.add_node("finalize", finalize)
 _builder.add_node("rerender", rerender)
-_builder.add_node("approve_report", approve_report)
 _builder.add_node("deliver", deliver)
 
-# Edges — per ARCHITECTURE.md §2
+# Edges
 _builder.add_edge(START, "load_collection")
 _builder.add_edge("load_collection", "precheck")
 _builder.add_conditional_edges(
@@ -82,21 +64,8 @@ _builder.add_conditional_edges(
     route_after_precheck,
     {"analyze": "analyze", END: END},
 )
-_builder.add_edge("analyze", "prepare_research")
-_builder.add_edge("prepare_research", "review_research_plan")
-_builder.add_conditional_edges(
-    "review_research_plan",
-    route_after_research_plan_review,
-    {"research": "research", "prepare_research": "prepare_research"},
-)
-_builder.add_edge("research", "finalize")
-_builder.add_edge("finalize", "rerender")
-_builder.add_edge("rerender", "approve_report")
-_builder.add_conditional_edges(
-    "approve_report",
-    route_after_report_approval,
-    {"deliver": "deliver", "finalize": "finalize"},
-)
+_builder.add_edge("analyze", "rerender")
+_builder.add_edge("rerender", "deliver")
 _builder.add_edge("deliver", END)
 
 
@@ -108,9 +77,6 @@ _builder.add_edge("deliver", END)
 # Only active when human_interrupts=True is passed to compile_graph().
 _HUMAN_INTERRUPT_NODES = [
     "analyze",
-    "review_research_plan",
-    "research",
-    "approve_report",
 ]
 
 

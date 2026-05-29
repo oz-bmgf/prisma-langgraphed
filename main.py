@@ -30,6 +30,11 @@ _env_path = Path(__file__).resolve().parent / ".env"
 if _env_path.exists():
     load_dotenv(_env_path, override=False)
 
+# Initialise OTEL before any src imports so LangChain/OpenAI/Anthropic
+# instrumentors are registered before the first SDK call.
+from observability.tracing import init_tracing as _init_tracing
+_init_tracing()
+
 from src.config import (
     CHECKPOINTER_BACKEND,
     CHECKPOINT_DB_PATH,

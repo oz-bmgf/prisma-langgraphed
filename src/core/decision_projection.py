@@ -26,7 +26,7 @@ from src.config import (
     DEFAULT_SYNTHESIS_MODEL,
 )
 from src.core.evidence_model import Decision
-from src.core.llm_utils import acall_llm
+from src.core.llm_utils import acall_llm, acall_structured
 from src.core.output_schemas import DecisionCandidate, DecisionProjectionOutput
 
 logger = logging.getLogger(__name__)
@@ -223,11 +223,11 @@ async def project_decisions(
     prompt = _build_decisions_prompt(scope_id, scope_output)
 
     try:
-        projection: DecisionProjectionOutput = await acall_llm(
+        projection: DecisionProjectionOutput = await acall_structured(
             prompt,
             system_msg=_SYSTEM_PROMPT,
             model=model,
-            output_schema=DecisionProjectionOutput,
+            schema=DecisionProjectionOutput,
             max_tokens=DEFAULT_MAX_TOKENS,
         )
         candidates = projection.decisions

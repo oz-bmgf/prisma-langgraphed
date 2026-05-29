@@ -1,0 +1,189 @@
+# Standalone observability stack — Langfuse v4.
+#
+# Phoenix is self-hosted on a cloud server — set PHOENIX_HOST + PHOENIX_API_KEY
+# in your .env and the application will send traces there directly.
+# This file only manages the Langfuse stack that runs locally.
+#
+#   docker compose -f docker-compose.observability.yml up -d
+#
+# UI endpoints after startup:
+#   Langfuse    http://localhost:3000   (first run: create an account, then a project)
+#
+# Required env vars (copy .env.example → .env and fill in):
+#   LANGFUSE_NEXTAUTH_SECRET   generate: openssl rand -base64 32
+#   LANGFUSE_SALT              generate: openssl rand -base64 32
+#
+# After Langfuse is up, create a project, copy the pk-lf-* / sk-lf-* keys,
+# and set LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY in your .env.
+
+services:
+
+  # ── Langfuse dependencies ────────────────────────────────────────────────────
+
+  lf-postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: langfuse
+      POSTGRES_DB: langfuse
+    volumes:
+      - lf_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Not exposed on the host — reachable by service name within this compose project.
+
+  lf-clickhouse:
+    image: clickhouse/clickhouse-server:24.12
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+    volumes:
+      - lf_clickhouse_data:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  lf-redis:
+    image: redis:7
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  lf-minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9091:9000"   # S3 API  (host:9091 → container:9000)
+      - "9092:9001"   # MinIO console → http://localhost:9092
+    environment:
+      MINIO_ROOT_USER: minio
+      MINIO_ROOT_PASSWORD: miniosecret
+    volumes:
+      - lf_minio_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  lf-minio-init:
+    image: minio/mc
+    depends_on:
+      lf-minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://lf-minio:9000 minio miniosecret &&
+        mc mb --ignore-existing local/langfuse-events &&
+        mc mb --ignore-existing local/langfuse-media
+      "
+
+  # ── Langfuse server + worker ─────────────────────────────────────────────────
+  # Image tag :3 == Langfuse Docker image v3, which ships the SDK v4 data model
+  # (rewritten March 2026). Do NOT use :2 — the OTEL ingestion path changed.
+
+  langfuse-server:
+    image: langfuse/langfuse:3
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@lf-postgres:5432/langfuse
+      NEXTAUTH_URL: http://localhost:3000
+      NEXTAUTH_SECRET: ${LANGFUSE_NEXTAUTH_SECRET}
+      SALT: ${LANGFUSE_SALT}
+      # ClickHouse (single-node — no Zookeeper / ReplicatedMergeTree needed)
+      CLICKHOUSE_URL: http://lf-clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:clickhouse@lf-clickhouse:9000
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      # Redis
+      REDIS_HOST: lf-redis
+      REDIS_PORT: 6379
+      # S3 — event storage (required in Langfuse v3+)
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse-events
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://lf-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      # S3 — media storage
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse-media
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://lf-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "true"
+      LANGFUSE_INGESTION_USE_IMMUTABLE_OBSERVATIONS: "true"
+    depends_on:
+      lf-postgres:
+        condition: service_healthy
+      lf-clickhouse:
+        condition: service_healthy
+      lf-redis:
+        condition: service_healthy
+      lf-minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/public/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    environment:
+      DATABASE_URL: postgresql://langfuse:langfuse@lf-postgres:5432/langfuse
+      CLICKHOUSE_URL: http://lf-clickhouse:8123
+      CLICKHOUSE_MIGRATION_URL: clickhouse://clickhouse:clickhouse@lf-clickhouse:9000
+      CLICKHOUSE_USER: clickhouse
+      CLICKHOUSE_PASSWORD: clickhouse
+      CLICKHOUSE_CLUSTER_ENABLED: "false"
+      REDIS_HOST: lf-redis
+      REDIS_PORT: 6379
+      LANGFUSE_S3_EVENT_UPLOAD_BUCKET: langfuse-events
+      LANGFUSE_S3_EVENT_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: http://lf-minio:9000
+      LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: langfuse-media
+      LANGFUSE_S3_MEDIA_UPLOAD_REGION: us-east-1
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: http://lf-minio:9000
+      LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: minio
+      LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: miniosecret
+      LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+      LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES: "true"
+      LANGFUSE_INGESTION_USE_IMMUTABLE_OBSERVATIONS: "true"
+    depends_on:
+      lf-postgres:
+        condition: service_healthy
+      lf-clickhouse:
+        condition: service_healthy
+      lf-redis:
+        condition: service_healthy
+      lf-minio-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3030/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+# ── Named volumes (persistent across restarts) ──────────────────────────────────
+
+volumes:
+  lf_postgres_data:
+  lf_clickhouse_data:
+  lf_minio_data:

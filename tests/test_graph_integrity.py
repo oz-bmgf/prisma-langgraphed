@@ -11,13 +11,13 @@ def _get_all_graphs():
     graphs["analyze"] = analyze_graph
     from src.graph.subgraphs.research import research_graph
     graphs["research"] = research_graph
-    from src.graph.agents.slr_graph import slr_graph
+    from src.graph.subgraphs.slr import slr_graph
     graphs["slr"] = slr_graph
-    from src.graph.agents.lbd_graph import lbd_graph
+    from src.graph.subgraphs.lbd import lbd_graph
     graphs["lbd"] = lbd_graph
-    from src.graph.agents.deep_web_graph import deep_web_graph
+    from src.graph.subgraphs.deep_web import deep_web_graph
     graphs["deep_web"] = deep_web_graph
-    from src.graph.agents.edison_graph import edison_graph
+    from src.graph.subgraphs.edison import edison_graph
     graphs["edison"] = edison_graph
     return graphs
 
@@ -95,7 +95,7 @@ def test_causal_graph_has_expected_nodes():
 
 
 def test_slr_graph_has_expected_nodes():
-    from src.graph.agents.slr_graph import slr_graph
+    from src.graph.subgraphs.slr import slr_graph
     nodes = set(slr_graph.nodes.keys())
     expected = {
         "slr_agent",
@@ -109,7 +109,7 @@ def test_slr_graph_has_expected_nodes():
 
 
 def test_lbd_graph_has_expected_nodes():
-    from src.graph.agents.lbd_graph import lbd_graph
+    from src.graph.subgraphs.lbd import lbd_graph
     nodes = set(lbd_graph.nodes.keys())
     expected = {
         "lbd_agent",

@@ -28,10 +28,13 @@ from src.config import (
     SCIENCE_MAX_ITERATIONS,
 )
 from src.core.evidence_model import ScienceInvestigationResult
+from langchain_core.runnables import RunnableConfig
+
 from src.core.investigation import _dedup_chunks, _execute_actions
-from src.core.llm_utils import acall_llm
+from src.core.llm_utils import acall_llm, acall_structured
 from src.core.output_schemas import ScienceActionsOutput
 from src.prompts.tool_prompts import SCIENCE_INVESTIGATE_SYSTEM
+from src.tools.science_tools import search_asta
 
 logger = logging.getLogger(__name__)
 
@@ -65,8 +68,7 @@ async def investigate_science_question(
     scope_id: str,
     question: str,
     *,
-    asta_client: Any = None,
-    tools: Any = None,
+    config: RunnableConfig | None = None,
     model: str = DEFAULT_SYNTHESIS_MODEL,
     max_iterations: int = SCIENCE_MAX_ITERATIONS,
     asta_soft_cap: int = ASTA_SOFT_CAP,
@@ -112,11 +114,11 @@ async def investigate_science_question(
         )
 
         try:
-            output: ScienceActionsOutput = await acall_llm(
+            output: ScienceActionsOutput = await acall_structured(
                 prompt,
                 system_msg=SCIENCE_INVESTIGATE_SYSTEM,
                 model=model,
-                output_schema=ScienceActionsOutput,
+                schema=ScienceActionsOutput,
                 max_tokens=DEFAULT_MAX_TOKENS,
             )
         except Exception as exc:
@@ -155,19 +157,20 @@ async def investigate_science_question(
         new_chunks: list[dict] = []
         wc = 0
 
-        # Execute ASTA actions (subject to soft cap)
+        # Execute ASTA actions via @tool search_asta (handles tracing + Semantic Scholar fallback)
         if asta_actions and asta_calls < asta_soft_cap:
             n_asta = min(len(asta_actions), asta_soft_cap - asta_calls)
             for action in asta_actions[:n_asta]:
-                asta_result = await _call_asta(action.get("query", ""), asta_client)
-                asta_hits.extend(asta_result)
+                query = action.get("query", "")
+                result_text: str = await search_asta.ainvoke({"query": query}, config=config)
+                asta_hits.append({"query": query, "result": result_text})
                 asta_calls += 1
                 asta_called_ever = True
-                for hit in asta_result:
+                if result_text:
                     new_chunks.append({
-                        "text": f"{hit.get('title', '')}. {hit.get('abstract', '')}",
-                        "file_id": f"asta:{hit.get('paperId', '')}",
-                        "filename": hit.get("title", "unknown paper"),
+                        "text": result_text,
+                        "file_id": f"asta:search:{query[:60]}",
+                        "filename": f"ASTA: {query[:80]}",
                         "collection": "science",
                         "doc_type": "science",
                     })
@@ -178,7 +181,7 @@ async def investigate_science_question(
         # Execute non-ASTA actions via shared dispatcher
         if other_actions:
             other_chunks, wc = await _execute_actions(
-                other_actions, tools, inv_id, bow_id, model
+                other_actions, config, inv_id, bow_id, model
             )
             new_chunks.extend(other_chunks)
             web_calls += wc
@@ -281,18 +284,3 @@ def _build_prompt(
     )
 
 
-async def _call_asta(query: str, asta_client: Any) -> list[dict]:
-    if asta_client is None:
-        return []
-    import inspect
-    try:
-        search_fn = getattr(asta_client, "search", None)
-        if search_fn is None:
-            return []
-        if inspect.iscoroutinefunction(search_fn):
-            return await search_fn(query)
-        # asyncio-APPROVED-1: to_thread wraps blocking ASTA HTTP call
-        return await asyncio.to_thread(search_fn, query)
-    except Exception as exc:
-        logger.warning("_call_asta failed for query '%s': %s", query[:60], exc)
-        return []

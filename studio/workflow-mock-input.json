@@ -4,8 +4,8 @@
   "collection_name": "mock",
   "base_dir": "/Users/ozgurozmen/qpr-collections",
   "ingested_dir": "/Users/ozgurozmen/qpr-collections/MOCK-ingested",
-  "research_model": "claude-haiku-4-5-20251001",
-  "synthesis_model": "claude-haiku-4-5-20251001",
+  "research_model": "gpt-4.1",
+  "synthesis_model": "claude-haiku-4-5",
   "research_plan_approved": true,
   "report_approved": true
 }

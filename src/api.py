@@ -29,10 +29,10 @@ from pydantic import BaseModel
 from sse_starlette import ServerSentEvent
 from sse_starlette.sse import EventSourceResponse
 
+from observability.tracing import init_tracing, shutdown as tracing_shutdown
 from src.backends.factory import build_search_backend
 from src.config import DEFAULT_RESEARCH_MODEL, DEFAULT_SYNTHESIS_MODEL
 from src.core.checkpointer import build_checkpointer
-from src.core.telemetry import setup_telemetry
 from src.graph.workflow import compile_graph, create_initial_state, make_thread_id
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,8 @@ class ResumeRequest(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    setup_telemetry("nqpr-api")
+    # Initialise OTEL before any LLM calls — registers all three exporters.
+    init_tracing("nqpr-api")
     async with build_checkpointer() as checkpointer:
         app.state.graph = compile_graph(checkpointer)
         # asyncio-APPROVED-4: Task/Queue restricted to api.py SSE infrastructure
@@ -90,6 +91,8 @@ async def lifespan(app: FastAPI):
         # asyncio-APPROVED-4: Task/Queue restricted to api.py SSE infrastructure
         app.state.resume_queues: dict[str, asyncio.Queue] = {}
         yield
+    # Flush all pending spans to every backend before the process exits.
+    tracing_shutdown()
 
 
 # ---------------------------------------------------------------------------

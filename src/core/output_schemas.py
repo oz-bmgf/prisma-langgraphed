@@ -1,7 +1,7 @@
 """Pydantic v2 structured output schemas for NQPR pipeline LLM calls.
 
-Usage with acall_llm:
-    result = await acall_llm(prompt, model=model, output_schema=ScopesOutput)
+Usage with acall_structured:
+    result = await acall_structured(prompt, model=model, schema=ScopesOutput)
     # result is a validated ScopesOutput instance
 """
 from __future__ import annotations

@@ -11,8 +11,6 @@ from src.graph.workflow import (
     create_initial_state,
     make_thread_id,
     route_after_precheck,
-    route_after_report_approval,
-    route_after_research_plan_review,
 )
 
 
@@ -22,11 +20,7 @@ from src.graph.workflow import (
 
 
 def _state(**overrides) -> dict:
-    base = {
-        "precheck_passed": None,
-        "research_plan_approved": None,
-        "report_approved": None,
-    }
+    base = {"precheck_passed": None}
     base.update(overrides)
     return base
 
@@ -62,11 +56,7 @@ def test_graph_has_all_nodes():
         "load_collection",
         "precheck",
         "analyze",
-        "prepare_research",
-        "review_research_plan",
-        "research",
-        "finalize",
-        "approve_report",
+        "rerender",
         "deliver",
     }
     assert node_names == expected
@@ -87,40 +77,6 @@ def test_route_after_precheck_fail():
 
 def test_route_after_precheck_none_fails():
     assert route_after_precheck(_state(precheck_passed=None)) == END
-
-
-# ---------------------------------------------------------------------------
-# route_after_research_plan_review
-# ---------------------------------------------------------------------------
-
-
-def test_route_after_research_plan_review_approve():
-    assert route_after_research_plan_review(_state(research_plan_approved=True)) == "research"
-
-
-def test_route_after_research_plan_review_regenerate():
-    assert route_after_research_plan_review(_state(research_plan_approved=False)) == "prepare_research"
-
-
-def test_route_after_research_plan_review_none_regenerates():
-    assert route_after_research_plan_review(_state(research_plan_approved=None)) == "prepare_research"
-
-
-# ---------------------------------------------------------------------------
-# route_after_report_approval
-# ---------------------------------------------------------------------------
-
-
-def test_route_after_report_approval_approve():
-    assert route_after_report_approval(_state(report_approved=True)) == "deliver"
-
-
-def test_route_after_report_approval_revise():
-    assert route_after_report_approval(_state(report_approved=False)) == "finalize"
-
-
-def test_route_after_report_approval_none_revises():
-    assert route_after_report_approval(_state(report_approved=None)) == "finalize"
 
 
 # ---------------------------------------------------------------------------

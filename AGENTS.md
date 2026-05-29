@@ -731,28 +731,90 @@ result = await asyncio.to_thread(_read_json, path)
 
 ### Architecture
 
-Traces fan out at the OTEL collector level — the graph emits one OTEL stream, and the collector forwards it to both backends. See `ARCHITECTURE.md §15` for the full fan-out diagram and environment variable reference.
+The app sends all spans via a single gRPC `BatchSpanProcessor` to a local
+`otel-collector` sidecar.  The collector fans out to Phoenix and Langfuse based
+on env vars resolved at container startup.  LangSmith stays on the native
+`LANGCHAIN_TRACING_V2` SDK path — no OTEL exporter for LangSmith is registered
+in `observability/tracing.py`.
 
 ```
-Graph process
+Application process
     │
-    │  OTEL SDK → grpc:4317
-    ▼
-OTEL Collector  (otel-collector container)
-    │
-    ├──► LangSmith  (https://api.smith.langchain.com/otel)
-    └──► Langfuse   (http://langfuse-server:3000/api/public/otel)
+    └──► BatchSpanProcessor ──► OTLPSpanExporter (gRPC) ──► otel-collector:4317
+           (background thread)                               (Docker service)
+                                                                     │
+                                                               ┌─────┴─────┐
+                                                               ▼           ▼
+                                                           Phoenix     Langfuse
+                             (when PHOENIX_TRACING_ENABLED=true in .env)
+                             (when LANGFUSE_TRACING_ENABLED=true in .env)
+
+LangSmith ◄──── LANGCHAIN_TRACING_V2 native SDK (direct, no collector)
 ```
+
+### Collector config generation
+
+The collector YAML is **generated at container startup** — not static — because
+the OTEL Collector YAML format has no native conditional syntax.
+`otel/generate_config.py` (the container entrypoint) reads env vars, renders
+`otel/collector.config.yaml.j2` via Jinja2, writes the result to
+`/etc/otel/collector.config.yaml`, then `exec`s `otelcol-contrib` as PID 1.
+
+**To toggle a backend or change its endpoint:**
+1. Edit `.env` (e.g. set `PHOENIX_TRACING_ENABLED=false` or update `LANGFUSE_ENDPOINT`)
+2. Rebuild and restart the collector only:
+   ```bash
+   docker compose build otel-collector
+   docker compose up -d otel-collector
+   ```
+
+If neither backend is enabled the exporters list is empty and the collector
+starts with a warning — it does not crash.
 
 ### Initialization
 
-`src/observability.init_tracing()` is called once from `main.py` before the graph is compiled. It is idempotent and fails silently if the collector is unreachable. `LangchainInstrumentor` is activated inside `init_tracing()` — **no per-agent or per-node instrumentation code is needed**.
+`observability.tracing.init_tracing()` is called once from `main.py` before the
+graph is compiled. It is idempotent and fails silently if the collector is
+unreachable. `LangChainInstrumentor` is activated inside `init_tracing()` —
+**no per-agent or per-node instrumentation code is needed**.
 
-`src/core/telemetry.setup_telemetry()` delegates to `init_tracing()` for backward compatibility.
+`src/core/telemetry.setup_telemetry()` delegates to `init_tracing()` for
+backward compatibility.
+
+### Environment variables
+
+**App-side** (read by `observability/tracing.py`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `TRACING_ENABLED` | `true` | Master on/off; `false` registers `NoOpTracerProvider` and skips all OTEL |
+| `OTEL_SDK_DISABLED` | — | Legacy kill-switch, same effect as `TRACING_ENABLED=false` |
+| `OTEL_SERVICE_NAME` | `prisma-langgraphed` | Service name tag on all spans |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://localhost:4317` | gRPC endpoint for local collector |
+| `OTEL_BSP_SCHEDULE_DELAY_MILLIS` | `5000` | Export interval (ms) |
+| `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | `512` | Spans per export request |
+
+**Collector-side** (read by `otel/generate_config.py` at container startup)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `PHOENIX_TRACING_ENABLED` | `true` | Include Phoenix exporter in collector pipeline |
+| `PHOENIX_ENDPOINT` | — | Full OTLP/HTTP endpoint (e.g. `http://host:6006/v1/traces`) |
+| `LANGFUSE_TRACING_ENABLED` | `true` | Include Langfuse exporter in collector pipeline |
+| `LANGFUSE_ENDPOINT` | — | Full OTLP/HTTP endpoint for Langfuse |
+| `LANGFUSE_PUBLIC_KEY` | — | Used to build Basic auth header |
+| `LANGFUSE_SECRET_KEY` | — | Used to build Basic auth header |
+
+**LangSmith (native SDK — do not touch)**
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LANGSMITH_API_KEY` | — | LangSmith API key (also accepted as `LANGCHAIN_API_KEY`) |
+| `LANGCHAIN_TRACING_V2` | — | Enables the LangChain native SDK integration |
 
 ### Auto-instrumentation coverage
 
-Every LLM call in this codebase goes through `acall_llm` in `src/core/llm_utils.py`, which delegates to LangChain's `ChatAnthropic` or `ChatOpenAI`. When `LangchainInstrumentor` is active, every `.ainvoke` call is automatically captured as an OTEL span — including structured-output calls (`llm.with_structured_output(schema).ainvoke(...)`).
+Every LLM call in this codebase goes through `acall_llm` in `src/core/llm_utils.py`, which delegates to LangChain's `ChatAnthropic` or `ChatOpenAI`. When `LangChainInstrumentor` is active, every `.ainvoke` call is automatically captured as an OTEL span — including structured-output calls (`llm.with_structured_output(schema).ainvoke(...)`).
 
 ### Why `config: RunnableConfig` matters for span nesting
 
@@ -762,7 +824,7 @@ Every LLM call in this codebase goes through `acall_llm` in `src/core/llm_utils.
 response = await llm.ainvoke(messages, config=config)
 ```
 
-The `config` object carries the active trace context (run ID, parent run ID) injected by LangGraph when the node is executed. Passing it through is what causes LangChain to attach the LLM span as a child of the current node span in LangSmith and Langfuse. **Without `config`, every LLM call appears as a root-level span with no parent.**
+The `config` object carries the active trace context (run ID, parent run ID) injected by LangGraph when the node is executed. Passing it through is what causes LangChain to attach the LLM span as a child of the current node span. **Without `config`, every LLM call appears as a root-level span with no parent.**
 
 Rule: every node that calls `acall_llm` must pass its own `config` argument through:
 
@@ -772,10 +834,6 @@ async def my_node(state: WorkflowState, config: RunnableConfig) -> dict:
 ```
 
 ### Calls that are NOT auto-instrumented
-
-No agent in this codebase makes raw `anthropic` SDK calls outside of LangChain — all LLM calls go through `acall_llm` or LangChain's `ChatOpenAI(use_responses_api=True)` (`deep_web.py`), both of which are auto-instrumented.
-
-The only uninstrumented calls are embedding queries in search backends:
 
 | Call site | Reason | Action |
 |---|---|---|
@@ -797,6 +855,6 @@ with tracer.start_as_current_span("embed_query") as span:
 
 | Call site | Goes through LangChain | Auto-instrumented | Action needed |
 |---|---|---|---|
-| All `acall_llm` callers (every node, every agent) | Yes | Yes — via `LangchainInstrumentor` | Pass `config` through |
-| `deep_web.py` — `ChatOpenAI(use_responses_api=True)` | Yes | Yes — via `LangchainInstrumentor` | Pass `config` through (already done) |
+| All `acall_llm` callers (every node, every agent) | Yes | Yes — via `LangChainInstrumentor` | Pass `config` through |
+| `deep_web.py` — `ChatOpenAI(use_responses_api=True)` | Yes | Yes — via `LangChainInstrumentor` | Pass `config` through (already done) |
 | `local.py`, `qdrant.py` — `embeddings.create()` | No | No | Add manual span if embedding latency tracking needed |

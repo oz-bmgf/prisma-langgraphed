@@ -39,7 +39,14 @@ dependencies = [
     "opentelemetry-sdk==1.42.1",
     "opentelemetry-exporter-otlp-proto-grpc==1.42.1",
     "opentelemetry-exporter-otlp-proto-http==1.42.1",
-    "opentelemetry-instrumentation-langchain>=0.1",
+    # OpenInference instrumentors — LangChain + OpenAI + Anthropic
+    "openinference-instrumentation-langchain>=0.1",
+    "openinference-instrumentation-openai>=0.1",
+    "openinference-instrumentation-anthropic>=0.1",
+    # LangSmith SDK (project/run management beyond pure OTEL)
+    "langsmith>=0.2",
+    # Arize Phoenix OTEL helpers (register(), project tagging, etc.)
+    "arize-phoenix-otel>=0.6",
     # Langfuse v4 (rewritten March 2026 — do NOT use v3 SDK patterns)
     "langfuse>=4.6.1",
     # HTTP API

@@ -55,7 +55,7 @@ def _make_lifespan_patches(mock_graph):
     return [
         patch("src.api.compile_graph", return_value=mock_graph),
         patch("src.api.build_checkpointer", _mock_build_checkpointer),
-        patch("src.api.setup_telemetry"),
+        patch("src.api.init_tracing"),
     ]
 
 

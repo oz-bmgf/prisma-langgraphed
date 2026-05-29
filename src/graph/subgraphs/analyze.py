@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
@@ -46,8 +47,9 @@ from src.config import DEFAULT_SYNTHESIS_MODEL as _DEFAULT_MODEL
 from src.core.llm_utils import acall_llm
 from src.graph.state import (
     AnalyzeState,
+    InvestmentNarrativeState,
     InvestmentReportWorkerState,
-    ScopeNarrativeState,
+    ScopeSynthesisState,
     SectionDraftWorkerState,
 )
 
@@ -257,7 +259,7 @@ async def compute_scopes(state: AnalyzeState, config: RunnableConfig = None) -> 
     bow_investment_map = state.get("bow_investment_map") or {}
     focus_bows = state.get("focus_bows")
 
-    MIN_CHUNKS = 200     # skip threshold
+    MIN_CHUNKS = int(os.environ.get("NQPR_MIN_CHUNKS_PER_BOW", "5"))  # skip threshold
     SPLIT_CHUNKS = 12_000  # split-by-BOW threshold
     SPLIT_INVS = 8       # split-by-investment-count threshold
 
@@ -440,159 +442,238 @@ async def build_timelines(state: AnalyzeState, config: RunnableConfig = None) ->
 
 
 # ---------------------------------------------------------------------------
-# dispatch_timeline_narratives — Phase 2.6 (pure router, returns list[Send])
+# dispatch_investment_narratives — Phase 2.6 router (fan-out per investment)
 # ---------------------------------------------------------------------------
 
 
-async def dispatch_timeline_narratives(state: AnalyzeState):
-    """Fan-out: one Send per scope for LLM narrative generation.
+async def dispatch_investment_narratives(state: AnalyzeState):
+    """Fan-out: one Send per investment for per-investment LLM narrative generation.
 
-    Skips scopes whose scope_id is already present in timeline_narrative_results
-    (i.e. this is a resumed run with a LangGraph checkpoint — no file cache used).
+    Two-level fan-out: investment narratives first, then scope synthesis.
+    Resume-safe: skips investments already in investment_narrative_results.
     """
     scopes = state.get("scopes") or []
     if not scopes:
-        return "collect_timeline_narratives"
+        return "collect_investment_narratives"
 
     scope_timelines = state.get("scope_timelines") or {}
-    model = state.get("synthesis_model") or _DEFAULT_MODEL
     investment_scoring = state.get("investment_scoring") or {}
+    model = state.get("synthesis_model") or _DEFAULT_MODEL
 
-    # State-based resume check: skip scopes already in timeline_narrative_results
     already_done: set[str] = {
-        r.get("scope_id", "")
-        for r in (state.get("timeline_narrative_results") or [])
-        if r.get("scope_id")
+        f"{r['scope_id']}:{r['inv_id']}"
+        for r in (state.get("investment_narrative_results") or [])
+        if r.get("scope_id") and r.get("inv_id")
     }
 
     sends: list[Send] = []
     for scope in scopes:
         scope_id = scope.get("scope_id", "")
         inv_id = scope.get("inv_id", "")
+        scope_tl_dict = scope_timelines.get(scope_id) or {}
+        scope_label = scope_tl_dict.get("label", inv_id)
+        investments = scope_tl_dict.get("investments") or []
 
-        # Skip if already computed (resumed run via LangGraph checkpoint)
+        if investments:
+            for inv_d in investments:
+                iid = inv_d.get("inv_id", inv_id)
+                if f"{scope_id}:{iid}" in already_done:
+                    continue
+                sends.append(Send("generate_investment_narrative", {
+                    "scope_id": scope_id,
+                    "scope_label": scope_label,
+                    "inv_id": iid,
+                    "inv_data": inv_d,
+                    "model": model,
+                }))
+        else:
+            # Fallback: no ScopeTimeline investments — send minimal financial dict
+            if f"{scope_id}:{inv_id}" in already_done:
+                continue
+            inv_scoring = investment_scoring.get(inv_id) or {}
+            sends.append(Send("generate_investment_narrative", {
+                "scope_id": scope_id,
+                "scope_label": scope_label,
+                "inv_id": inv_id,
+                "inv_data": {
+                    "inv_id": inv_id,
+                    "start": inv_scoring.get("start", "") if isinstance(inv_scoring, dict) else "",
+                    "end": inv_scoring.get("end", "") if isinstance(inv_scoring, dict) else "",
+                    "status": inv_scoring.get("status", "") if isinstance(inv_scoring, dict) else "",
+                    "approved_amount": inv_scoring.get("approved_amount", 0) if isinstance(inv_scoring, dict) else 0,
+                    "paid_amount": inv_scoring.get("paid_amount", 0) if isinstance(inv_scoring, dict) else 0,
+                },
+                "model": model,
+            }))
+
+    return sends or "collect_investment_narratives"
+
+
+# ---------------------------------------------------------------------------
+# generate_investment_narrative — Phase 2.6 per-investment worker
+# ---------------------------------------------------------------------------
+
+
+async def generate_investment_narrative(state: InvestmentNarrativeState) -> dict:
+    """Generate a narrative for a single investment. One LLM call, no asyncio.gather."""
+    from dataclasses import fields as dc_fields
+    from src.core.investment_timeline import (
+        DocumentEvent, InvestmentTimeline,
+        _build_single_investment_narrative,
+    )
+
+    scope_id = state["scope_id"]
+    scope_label = state.get("scope_label", "")
+    inv_id = state["inv_id"]
+    inv_data = state["inv_data"]
+    model = state["model"]
+
+    narrative = ""
+
+    if inv_data.get("documents") is not None:
+        # Rich path: reconstruct InvestmentTimeline and call the core narrative builder
+        inv_fields = {f.name for f in dc_fields(InvestmentTimeline)}
+        doc_fields = {f.name for f in dc_fields(DocumentEvent)}
+        docs = [
+            DocumentEvent(**{k: v for k, v in doc.items() if k in doc_fields})
+            for doc in (inv_data.get("documents") or [])
+        ]
+        inv_obj = InvestmentTimeline(
+            **{k: v for k, v in inv_data.items() if k in inv_fields and k != "documents"}
+        )
+        inv_obj.documents = docs
+        try:
+            await _build_single_investment_narrative(inv_obj, scope_id, scope_label, model)
+            narrative = inv_obj.narrative or ""
+        except Exception as exc:
+            logger.warning(
+                "generate_investment_narrative (rich) failed %s/%s: %s", scope_id, inv_id, exc
+            )
+    else:
+        # Fallback path: minimal financial summary
+        prompt = (
+            f"Investment {inv_id} timeline narrative: "
+            f"start={inv_data.get('start', '')}, end={inv_data.get('end', '')}, "
+            f"status={inv_data.get('status', '')}, "
+            f"approved=${float(inv_data.get('approved_amount', 0) or 0) / 1e6:.1f}M, "
+            f"paid=${float(inv_data.get('paid_amount', 0) or 0) / 1e6:.1f}M. "
+            "Summarise the financial timeline and execution status in 2-3 sentences."
+        )
+        try:
+            narrative = str(await acall_llm(prompt, model=model))
+        except Exception as exc:
+            logger.warning(
+                "generate_investment_narrative (fallback) failed %s/%s: %s", scope_id, inv_id, exc
+            )
+
+    return {"investment_narrative_results": [{
+        "scope_id": scope_id,
+        "inv_id": inv_id,
+        "narrative": narrative,
+        "inv_data": inv_data,
+    }]}
+
+
+# ---------------------------------------------------------------------------
+# collect_investment_narratives — Phase 2.6 sync point
+# ---------------------------------------------------------------------------
+
+
+async def collect_investment_narratives(state: AnalyzeState) -> dict:
+    """Sync point: all investment_narrative_results accumulated; dispatch_scope_syntheses fans out next."""
+    n = len(state.get("investment_narrative_results") or [])
+    logger.info("collect_investment_narratives: %d investment narratives ready", n)
+    return {}
+
+
+# ---------------------------------------------------------------------------
+# dispatch_scope_syntheses — Phase 2.6 second router (fan-out per scope)
+# ---------------------------------------------------------------------------
+
+
+async def dispatch_scope_syntheses(state: AnalyzeState):
+    """Fan-out: one Send per scope to generate the scope-level synthesis from investment narratives."""
+    inv_results = state.get("investment_narrative_results") or []
+    if not inv_results:
+        return "collect_timeline_narratives"
+
+    scope_timelines = state.get("scope_timelines") or {}
+    model = state.get("synthesis_model") or _DEFAULT_MODEL
+
+    already_done: set[str] = {
+        r.get("scope_id", "")
+        for r in (state.get("timeline_narrative_results") or [])
+        if r.get("scope_id")
+    }
+
+    by_scope: dict[str, list[dict]] = {}
+    for r in inv_results:
+        sid = r.get("scope_id", "")
+        if sid:
+            by_scope.setdefault(sid, []).append(r)
+
+    sends: list[Send] = []
+    for scope_id, narratives in by_scope.items():
         if scope_id in already_done:
             continue
-
-        # Use pre-built ScopeTimeline dict if available; fall back to basic data
-        scope_tl = scope_timelines.get(scope_id) or {}
-        investments_in_tl = scope_tl.get("investments") or []
-
-        # Skip if scope timeline already has full narratives (shouldn't happen on fresh run)
-        if investments_in_tl and all(
-            inv.get("narrative") for inv in investments_in_tl
-        ):
-            continue
-
-        inv_data = investment_scoring.get(inv_id) or {}
-        timeline: dict[str, Any] = {
+        scope_tl_dict = scope_timelines.get(scope_id) or {}
+        sends.append(Send("generate_scope_synthesis", {
             "scope_id": scope_id,
-            "inv_id": inv_id,
-            "start": inv_data.get("start", "") if isinstance(inv_data, dict) else "",
-            "end": inv_data.get("end", "") if isinstance(inv_data, dict) else "",
-            "status": inv_data.get("status", "") if isinstance(inv_data, dict) else "",
-            "approved_amount": inv_data.get("approved_amount", 0) if isinstance(inv_data, dict) else 0,
-            "paid_amount": inv_data.get("paid_amount", 0) if isinstance(inv_data, dict) else 0,
-            # Include the full pre-built ScopeTimeline dict so the worker has rich data
-            "scope_timeline_dict": scope_tl,
-        }
-        sends.append(Send("generate_scope_narrative", {
-            "scope_id": scope_id,
-            "inv_id": inv_id,
-            "timeline": timeline,
+            "scope_label": scope_tl_dict.get("label", ""),
+            "investment_narratives": narratives,
+            "scope_timeline_dict": scope_tl_dict,
             "model": model,
-            "result": None,
         }))
 
     return sends or "collect_timeline_narratives"
 
 
 # ---------------------------------------------------------------------------
-# generate_scope_narrative — Phase 2.6 (per-scope LLM worker)
+# generate_scope_synthesis — Phase 2.6 per-scope synthesis worker
 # ---------------------------------------------------------------------------
 
 
-async def generate_scope_narrative(state: ScopeNarrativeState) -> dict:
-    """Generate rich multi-paragraph narrative(s) for an investment scope.
+async def generate_scope_synthesis(state: ScopeSynthesisState) -> dict:
+    """Synthesise investment narratives into a scope-level paragraph. One LLM call."""
+    from src.core.investment_timeline import SCOPE_SYNTHESIS_SYSTEM
 
-    Uses the pre-built ScopeTimeline from build_timelines when available,
-    falling back to the basic financial timeline dict otherwise.
-    """
     scope_id = state["scope_id"]
-    inv_id = state["inv_id"]
-    timeline = state["timeline"]
+    scope_label = state.get("scope_label", "")
+    inv_narratives = state.get("investment_narratives") or []
+    scope_tl_dict = state.get("scope_timeline_dict") or {}
     model = state["model"]
 
-    scope_tl_dict = timeline.get("scope_timeline_dict") or {}
+    narrated = [n for n in inv_narratives if n.get("narrative")]
 
-    if scope_tl_dict.get("investments"):
-        # Rich path: use build_timeline_narratives_async on the ScopeTimeline
-        from src.core.investment_timeline import (
-            InvestmentTimeline, DocumentEvent, ScopeTimeline,
-            build_timeline_narratives_async,
-        )
-        from dataclasses import fields as dc_fields
+    # Rebuild updated scope_timeline_dict with per-investment narratives merged in
+    scope_tl_out = dict(scope_tl_dict)
+    scope_tl_out["scope_id"] = scope_id
+    inv_narrative_map = {n["inv_id"]: n["narrative"] for n in narrated}
+    scope_tl_out["investments"] = [
+        {**inv_d, "narrative": inv_narrative_map.get(inv_d.get("inv_id", ""), inv_d.get("narrative", ""))}
+        for inv_d in (scope_tl_dict.get("investments") or [])
+    ]
 
-        def _reconstruct() -> ScopeTimeline:
-            inv_fields = {f.name for f in dc_fields(InvestmentTimeline)}
-            doc_fields = {f.name for f in dc_fields(DocumentEvent)}
-            inv_objs = []
-            for inv_d in scope_tl_dict.get("investments", []):
-                docs = [
-                    DocumentEvent(**{k: v for k, v in doc.items() if k in doc_fields})
-                    for doc in (inv_d.get("documents") or [])
-                ]
-                inv_obj = InvestmentTimeline(
-                    **{k: v for k, v in inv_d.items() if k in inv_fields and k != "documents"}
-                )
-                inv_obj.documents = docs
-                inv_objs.append(inv_obj)
-            return ScopeTimeline(
-                scope_id=scope_tl_dict.get("scope_id", scope_id),
-                label=scope_tl_dict.get("label", inv_id),
-                bow_ids=scope_tl_dict.get("bow_ids", []),
-                investments=inv_objs,
-                scope_flags=scope_tl_dict.get("scope_flags", []),
-                narrative=scope_tl_dict.get("narrative", ""),
-            )
+    if not narrated:
+        logger.warning("[%s] No investment narratives available; skipping scope synthesis", scope_id)
+        return {"timeline_narrative_results": [scope_tl_out]}
 
-        try:
-            # asyncio-APPROVED-1: to_thread wraps dataclass reconstruction
-            scope_timeline = await asyncio.to_thread(_reconstruct)
-            await build_timeline_narratives_async(scope_timeline, model)
-            updated_tl = scope_timeline.to_dict()
-            updated_tl["scope_id"] = scope_id
-            return {"timeline_narrative_results": [updated_tl]}
-        except Exception as exc:
-            logger.error("generate_scope_narrative (rich) failed %s: %s", scope_id, exc)
-            return {
-                "timeline_narrative_results": [{"scope_id": scope_id}],
-                "errors": [f"timeline_narrative:{scope_id}:{exc}"],
-            }
-
-    # Fallback path: minimal 2-3 sentence narrative from basic financial data
-    prompt = (
-        f"Investment {inv_id} timeline narrative: "
-        f"start={timeline.get('start', '')}, end={timeline.get('end', '')}, "
-        f"status={timeline.get('status', '')}, "
-        f"approved=${float(timeline.get('approved_amount', 0) or 0) / 1e6:.1f}M, "
-        f"paid=${float(timeline.get('paid_amount', 0) or 0) / 1e6:.1f}M. "
-        "Summarise the financial timeline and execution status in 2-3 sentences."
-    )
     try:
-        narrative = await acall_llm(prompt, model=model)
-        timeline_out = dict(timeline)
-        timeline_out["narrative"] = narrative if isinstance(narrative, str) else str(narrative)
-        timeline_out["scope_id"] = scope_id
+        summaries = "\n\n---\n\n".join(
+            f"**{n['inv_id']}:**\n{n['narrative'][:2000]}" for n in narrated
+        )
+        scope_raw = await acall_llm(
+            f"# Scope: {scope_label}\n# {len(narrated)} investments\n\n"
+            f"Per-investment narratives:\n\n{summaries}\n\nWrite the scope-level synthesis.",
+            system_msg=SCOPE_SYNTHESIS_SYSTEM,
+            model=model,
+        )
+        if len(str(scope_raw)) > 50:
+            scope_tl_out["narrative"] = str(scope_raw)
     except Exception as exc:
-        logger.error("generate_scope_narrative (fallback) failed %s: %s", scope_id, exc)
-        timeline_out = {"scope_id": scope_id}
-        return {
-            "timeline_narrative_results": [timeline_out],
-            "errors": [f"timeline_narrative:{scope_id}:{exc}"],
-        }
+        logger.warning("[%s] Scope synthesis failed: %s", scope_id, str(exc)[:120])
 
-    return {"timeline_narrative_results": [timeline_out]}
+    return {"timeline_narrative_results": [scope_tl_out]}
 
 
 # ---------------------------------------------------------------------------
@@ -1348,7 +1429,9 @@ _builder.add_node("load_catalog", load_catalog)
 _builder.add_node("orientation", orientation)
 _builder.add_node("compute_scopes", compute_scopes)
 _builder.add_node("build_timelines", build_timelines)
-_builder.add_node("generate_scope_narrative", generate_scope_narrative)
+_builder.add_node("generate_investment_narrative", generate_investment_narrative)
+_builder.add_node("collect_investment_narratives", collect_investment_narratives)
+_builder.add_node("generate_scope_synthesis", generate_scope_synthesis)
 _builder.add_node("collect_timeline_narratives", collect_timeline_narratives)
 _builder.add_node("run_causal_pipeline", run_causal_pipeline)
 # dispatch_investment_reports and dispatch_scope_sections are conditional-edge routers, not nodes
@@ -1366,18 +1449,29 @@ _builder.add_edge("load_catalog", "orientation")
 _builder.add_edge("orientation", "compute_scopes")
 _builder.add_edge("compute_scopes", "build_timelines")
 
-# Phase 2.6 fan-out: build_timelines → dispatch_timeline_narratives (router)
-# → generate_scope_narrative (per-scope worker)
-# → collect_timeline_narratives (reducer)
+# Phase 2.6 two-level fan-out:
+# build_timelines → dispatch_investment_narratives (per-investment)
+#   → generate_investment_narrative × N → collect_investment_narratives
+#   → dispatch_scope_syntheses (per-scope)
+#   → generate_scope_synthesis × M → collect_timeline_narratives
 _builder.add_conditional_edges(
     "build_timelines",
-    dispatch_timeline_narratives,
+    dispatch_investment_narratives,
     {
-        "generate_scope_narrative": "generate_scope_narrative",
+        "generate_investment_narrative": "generate_investment_narrative",
+        "collect_investment_narratives": "collect_investment_narratives",
+    },
+)
+_builder.add_edge("generate_investment_narrative", "collect_investment_narratives")
+_builder.add_conditional_edges(
+    "collect_investment_narratives",
+    dispatch_scope_syntheses,
+    {
+        "generate_scope_synthesis": "generate_scope_synthesis",
         "collect_timeline_narratives": "collect_timeline_narratives",
     },
 )
-_builder.add_edge("generate_scope_narrative", "collect_timeline_narratives")
+_builder.add_edge("generate_scope_synthesis", "collect_timeline_narratives")
 _builder.add_edge("collect_timeline_narratives", "run_causal_pipeline")
 # §3.5 fan-out: run_causal_pipeline → dispatch_investment_reports → [build_investment_report_worker × N]
 #                                                                  → collect_investment_reports

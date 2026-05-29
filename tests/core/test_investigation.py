@@ -97,7 +97,7 @@ async def test_run_investigation_returns_investigation_result():
         evidence_refs=["§0001"],
         next_actions=[],
     )
-    with patch("src.core.investigation.acall_llm", new=AsyncMock(return_value=mock_output)):
+    with patch("src.core.investigation.acall_structured", new=AsyncMock(return_value=mock_output)):
         result = await run_investigation(
             link_id="link-001",
             inv_id="INV-001",
@@ -124,7 +124,7 @@ async def test_run_investigation_stops_on_terminal_status():
             next_actions=[],
         )
 
-    with patch("src.core.investigation.acall_llm", new=mock_llm):
+    with patch("src.core.investigation.acall_structured", new=mock_llm):
         result = await run_investigation(
             link_id="link-002",
             inv_id="INV-002",
@@ -151,7 +151,7 @@ async def test_run_investigation_saturation_stops_loop():
             next_actions=[InvestigationAction(tool="search_investment", query="test query")],
         )
 
-    with patch("src.core.investigation.acall_llm", new=mock_llm), \
+    with patch("src.core.investigation.acall_structured", new=mock_llm), \
          patch("src.core.investigation._execute_actions", new=AsyncMock(return_value=([], 0))):
         result = await run_investigation(
             link_id="link-003",
@@ -174,7 +174,7 @@ async def test_run_investigation_no_tools_returns_empty_evidence():
         answer="No documents available.",
         next_actions=[],
     )
-    with patch("src.core.investigation.acall_llm", new=AsyncMock(return_value=mock_output)):
+    with patch("src.core.investigation.acall_structured", new=AsyncMock(return_value=mock_output)):
         result = await run_investigation(
             link_id="link-004",
             inv_id="INV-004",
@@ -182,7 +182,6 @@ async def test_run_investigation_no_tools_returns_empty_evidence():
             scope_id="S-04",
             claim={"name": "Z→W"},
             model="claude-haiku-4-5-20251001",
-            tools=None,
         )
     assert result.total_chunks_retrieved == 0
     assert result.web_searches == 0
@@ -192,7 +191,7 @@ async def test_run_investigation_result_has_to_dict():
     mock_output = InvestigationActionsOutput(
         status="answered", confidence="high", answer="Done.", next_actions=[]
     )
-    with patch("src.core.investigation.acall_llm", new=AsyncMock(return_value=mock_output)):
+    with patch("src.core.investigation.acall_structured", new=AsyncMock(return_value=mock_output)):
         result = await run_investigation(
             link_id="link-005",
             inv_id="INV-005",

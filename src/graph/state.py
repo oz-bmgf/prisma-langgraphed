@@ -132,6 +132,8 @@ class InvestmentRubricState(TypedDict):
     timeline: dict                   # serialised InvestmentTimeline
     result: Optional[dict]           # InvestmentEvidencePack — filled by worker
     research_model: str              # model used for LLM calls in this worker
+    ingested_dir: str                # fallback for _get_tools when search_backend absent from config
+    collection_name: str             # fallback for _get_tools when search_backend absent from config
 
 
 class LinkInvestigationState(TypedDict):
@@ -140,9 +142,12 @@ class LinkInvestigationState(TypedDict):
     inv_id: str
     bow_id: str
     scope_id: str
+    scope_label: str                  # human-readable scope label for excerpt CSV output
     claim: dict                      # serialised InvestigationClaim
     model: str
     result: Optional[dict]           # LinkAssessment — filled by worker
+    ingested_dir: str                # fallback for _get_tools when search_backend absent from config
+    collection_name: str             # fallback for _get_tools when search_backend absent from config
 
 
 class ScienceAssumptionState(TypedDict):
@@ -154,15 +159,26 @@ class ScienceAssumptionState(TypedDict):
     question: str
     result: Optional[dict]           # ScienceInvestigationResult — filled by worker
     research_model: str              # model used for LLM calls in this worker
+    ingested_dir: str                # fallback for _get_tools when search_backend absent from config
+    collection_name: str             # fallback for _get_tools when search_backend absent from config
 
 
-class ScopeNarrativeState(TypedDict):
-    """Sent per-scope into generate_scope_narrative (analyze subgraph Send() fan-out)."""
+class InvestmentNarrativeState(TypedDict):
+    """Sent per-investment into generate_investment_narrative (analyze subgraph §2.6 fan-out)."""
     scope_id: str
+    scope_label: str
     inv_id: str
-    timeline: dict                   # {scope_id, inv_id, start, end, status, amounts}
+    inv_data: dict     # InvestmentTimeline.to_dict() or minimal financial dict for fallback
     model: str
-    result: Optional[dict]           # filled by generate_scope_narrative
+
+
+class ScopeSynthesisState(TypedDict):
+    """Sent per-scope into generate_scope_synthesis (analyze subgraph §2.6 second fan-out)."""
+    scope_id: str
+    scope_label: str
+    investment_narratives: list    # [{scope_id, inv_id, narrative, inv_data}, ...]
+    scope_timeline_dict: dict
+    model: str
 
 
 class BowEnrichmentWorkerState(TypedDict):
@@ -365,6 +381,7 @@ class AnalyzeState(TypedDict):
     link_assessments: Annotated[list[dict], operator.add]
     science_results: Annotated[list[dict], operator.add]
     scope_decisions: Annotated[list[dict], operator.add]
+    investment_narrative_results: Annotated[list[dict], operator.add]  # per-investment; feeds dispatch_scope_syntheses
     timeline_narrative_results: Annotated[list[dict], operator.add]
     all_excerpts: Annotated[list[dict], operator.add]   # top-10 per link by credibility_tier desc, ~50 chars each
 

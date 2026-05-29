@@ -68,7 +68,7 @@ async def fan_out_research_tasks(state: ResearchDispatchState) -> list[Send] | s
 # ---------------------------------------------------------------------------
 
 
-async def slr_worker(state: ResearchTaskState, config: RunnableConfig | None = None) -> dict:
+async def slr_worker(state: ResearchTaskState, config: RunnableConfig = None) -> dict:
     import time
     from datetime import datetime, timezone
 
@@ -129,7 +129,7 @@ async def slr_worker(state: ResearchTaskState, config: RunnableConfig | None = N
 # ---------------------------------------------------------------------------
 
 
-async def lbd_worker(state: ResearchTaskState, config: RunnableConfig | None = None) -> dict:
+async def lbd_worker(state: ResearchTaskState, config: RunnableConfig = None) -> dict:
     import time
     from datetime import datetime, timezone
 
@@ -188,7 +188,7 @@ async def lbd_worker(state: ResearchTaskState, config: RunnableConfig | None = N
 # ---------------------------------------------------------------------------
 
 
-async def deep_web_worker(state: ResearchTaskState, config: RunnableConfig | None = None) -> dict:
+async def deep_web_worker(state: ResearchTaskState, config: RunnableConfig = None) -> dict:
     import re
     import time
     from datetime import datetime, timezone
@@ -253,7 +253,7 @@ async def deep_web_worker(state: ResearchTaskState, config: RunnableConfig | Non
 # ---------------------------------------------------------------------------
 
 
-async def edison_worker(state: ResearchTaskState, config: RunnableConfig | None = None) -> dict:
+async def edison_worker(state: ResearchTaskState, config: RunnableConfig = None) -> dict:
     import time
     from datetime import datetime, timezone
 

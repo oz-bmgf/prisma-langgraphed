@@ -19,7 +19,7 @@ from src.config import (
     DEFAULT_SYNTHESIS_MODEL,
 )
 from src.core.evidence_model import CausalLink, CausalModel, ScoredAssumption
-from src.core.llm_utils import acall_llm
+from src.core.llm_utils import acall_llm, acall_structured
 from src.core.output_schemas import (
     CausalModelExtraction,
     ConsequenceForecast,
@@ -115,11 +115,11 @@ async def extract_causal_model(
     )
 
     try:
-        extracted: CausalModelExtraction = await acall_llm(
+        extracted: CausalModelExtraction = await acall_structured(
             prompt,
             system_msg=CAUSAL_EXTRACTION_SYSTEM,
             model=model,
-            output_schema=CausalModelExtraction,
+            schema=CausalModelExtraction,
             max_tokens=DEFAULT_MAX_TOKENS,
         )
         links = [
@@ -197,11 +197,11 @@ async def rank_assumptions(
     )
 
     try:
-        ranked: RankedAssumptionsOutput = await acall_llm(
+        ranked: RankedAssumptionsOutput = await acall_structured(
             prompt,
             system_msg=ASSUMPTION_RANKING_SYSTEM,
             model=model,
-            output_schema=RankedAssumptionsOutput,
+            schema=RankedAssumptionsOutput,
             max_tokens=DEFAULT_MAX_TOKENS,
         )
         scored: list[ScoredAssumption] = []
@@ -276,11 +276,11 @@ async def forecast_consequences(
     months_by_link: dict[str, float] = {}
 
     try:
-        forecast_result: ForecastOutput = await acall_llm(
+        forecast_result: ForecastOutput = await acall_structured(
             prompt,
             system_msg=CONSEQUENCE_FORECAST_SYSTEM,
             model=model,
-            output_schema=ForecastOutput,
+            schema=ForecastOutput,
             max_tokens=DEFAULT_MAX_TOKENS,
         )
         for fc in forecast_result.forecasts:

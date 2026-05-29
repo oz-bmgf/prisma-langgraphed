@@ -28,8 +28,15 @@ from src.config import (
     MAX_INVESTIGATION_ITERATIONS,
 )
 from src.core.evidence_model import InvestigationResult
-from src.core.llm_utils import acall_llm
+from src.core.llm_utils import acall_llm, acall_structured
 from src.core.output_schemas import InvestigationActionsOutput
+from src.tools.investigation_tools import (
+    compute,
+    read_document,
+    search_investment,
+    search_portfolio,
+    search_web,
+)
 from src.prompts.tool_prompts import (
     INVESTIGATION_SYSTEM,
     INVESTIGATION_TOOL_DESCRIPTIONS,
@@ -54,109 +61,95 @@ _SUPPORTED_TOOLS = frozenset({
 })
 
 
+_COLLECTION_TOOLS = frozenset({"search_investment", "search_bow", "search_doc_type", "search_all"})
+
+
 async def _execute_actions(
     actions: list[dict],
-    tools: Any,
+    config: Any,
     inv_id: str,
     bow_id: str,
     model: str,
     facts: Any = None,
 ) -> tuple[list[dict], int]:
-    """Async tool dispatcher — fan out tool actions concurrently.
+    """Async tool dispatcher — fan out tool actions concurrently via native @tool.ainvoke.
 
-    Returns (new_chunks, web_search_count). When tools is None or the
-    tool action is unknown, returns empty results gracefully.
+    Returns (new_chunks, web_search_count). Tracing is handled inside each
+    @tool function via append_to_buffer. When search_backend is absent from
+    config, collection search actions return empty results gracefully.
     """
     if not actions:
         return [], 0
 
-    async def _dispatch_one(action: dict) -> tuple[list[dict], int]:
-        tool = action.get("tool", "")
-        query = action.get("query", "")
-        if not query or tool not in _SUPPORTED_TOOLS:
-            return [], 0
+    base_configurable: dict = dict(((config or {}).get("configurable") or {}))
+    has_backend = base_configurable.get("search_backend") is not None
 
-        if tools is None:
+    # Per-action enriched configs inject inv_id / bow_id so the @tool functions
+    # apply the right filter without needing per-call function arguments.
+    _inv_config = {"configurable": {**base_configurable, "inv_id": inv_id, "bow_id": None}}
+    _bow_config = {"configurable": {**base_configurable, "inv_id": None, "bow_id": bow_id}}
+
+    async def _dispatch_one(action: dict) -> tuple[list[dict], int]:
+        tool_name = action.get("tool", "")
+        query = action.get("query", "")
+        if not query or tool_name not in _SUPPORTED_TOOLS:
+            return [], 0
+        if not has_backend and tool_name in _COLLECTION_TOOLS:
             return [], 0
 
         chunks: list[dict] = []
         web_count = 0
         try:
-            idx = getattr(tools, "_embedding_index", None)
-            _has_hybrid = idx is not None and hasattr(idx, "hybrid_search") and getattr(idx, "has_hybrid", False)
+            if tool_name == "search_investment":
+                text = await search_investment.ainvoke({"query": query}, config=_inv_config)
+                chunks.append({"text": text, "file_id": f"inv:{query[:60]}", "filename": "collection search", "collection": "investment", "doc_type": "investment"})
 
-            def _search(q: str, *, top_k: int = 10, **kw) -> list[dict]:
-                if _has_hybrid:
-                    return idx.hybrid_search(q, top_k=top_k, embedding_weight=0.5, **kw)
-                if idx is not None:
-                    return idx.search_with_filter(q, top_k=top_k, **kw)
-                return []
+            elif tool_name == "search_bow" and bow_id:
+                text = await search_investment.ainvoke({"query": query}, config=_bow_config)
+                chunks.append({"text": text, "file_id": f"bow:{query[:60]}", "filename": "BOW search", "collection": "investment", "doc_type": "investment"})
 
-            if tool == "search_investment":
-                # asyncio-APPROVED-1: to_thread wraps blocking embedding search
-                raw = await asyncio.to_thread(_search, query, inv_id=inv_id, top_k=10)
-                chunks.extend(raw)
-            elif tool == "search_bow" and bow_id:
-                # asyncio-APPROVED-1: to_thread wraps blocking embedding search
-                raw = await asyncio.to_thread(_search, query, bow_id=bow_id, top_k=10)
-                chunks.extend(raw)
-            elif tool == "search_doc_type":
-                doc_type = action.get("doc_type") or ""
-                kw: dict = {"top_k": 8}
-                if doc_type:
-                    kw["doc_type"] = doc_type
-                kw["inv_id"] = inv_id
-                # asyncio-APPROVED-1: to_thread wraps blocking embedding search
-                raw = await asyncio.to_thread(_search, query, **kw)
-                chunks.extend(raw)
-            elif tool == "search_all":
-                # asyncio-APPROVED-1: to_thread wraps blocking embedding search
-                raw = await asyncio.to_thread(_search, query, top_k=10)
-                chunks.extend(raw)
-            elif tool == "search_web":
-                web_fn = getattr(tools, "search_web", None)
-                if web_fn:
-                    # asyncio-APPROVED-1: to_thread wraps blocking web HTTP call
-                    result = await asyncio.to_thread(web_fn, query)
-                    if result:
-                        chunks.append({
-                            "text": str(result)[:4000],
-                            "file_id": f"web:{query[:40]}",
-                            "filename": "web search",
-                            "collection": "web",
-                            "doc_type": "web",
-                        })
-                    web_count += 1
-            elif tool == "read_pages":
+            elif tool_name == "search_doc_type":
+                doc_type = action.get("doc_type") or None
+                text = await search_investment.ainvoke(
+                    {"query": query, "doc_type": doc_type, "top_k": 8},
+                    config=_inv_config,
+                )
+                chunks.append({"text": text, "file_id": f"inv:{query[:60]}", "filename": "collection search", "collection": "investment", "doc_type": doc_type or "investment"})
+
+            elif tool_name == "search_all":
+                text = await search_portfolio.ainvoke({"query": query}, config=config)
+                chunks.append({"text": text, "file_id": f"all:{query[:60]}", "filename": "portfolio search", "collection": "investment", "doc_type": "all"})
+
+            elif tool_name == "search_web":
+                text = await search_web.ainvoke(
+                    {"query": query, "rationale": f"evidence for: {query}"},
+                    config=config,
+                )
+                chunks.append({"text": text, "file_id": f"web:{query[:40]}", "filename": "web search", "collection": "web", "doc_type": "web"})
+                web_count = 1
+
+            elif tool_name == "read_pages":
                 file_id = action.get("file_id", "")
                 page_start = int(action.get("page_start", 1))
-                page_end = int(action.get("page_end", page_start + 10))
-                page_end = min(page_end, page_start + 20)
-                read_fn = getattr(tools, "read_pages", None)
-                if file_id and read_fn:
-                    # asyncio-APPROVED-1: to_thread wraps blocking file read
-                    text = await asyncio.to_thread(read_fn, file_id, page_start, page_end)
+                page_end = min(int(action.get("page_end", page_start + 10)), page_start + 20)
+                if file_id:
+                    text = await read_document.ainvoke(
+                        {"file_id": file_id, "page_start": page_start, "page_end": page_end},
+                        config=config,
+                    )
                     if text and len(text.strip()) > 50:
-                        chunks.append({
-                            "text": text,
-                            "file_id": file_id,
-                            "filename": f"{file_id} pp{page_start}-{page_end}",
-                            "collection": "investment",
-                        })
-            elif tool == "compute" and facts:
-                compute_fn = getattr(tools, "compute", None)
-                if compute_fn:
-                    # asyncio-APPROVED-1: to_thread wraps blocking compute call
-                    result = await asyncio.to_thread(compute_fn, query, facts)
-                    if result:
-                        chunks.append({
-                            "text": str(result)[:4000],
-                            "file_id": "computed",
-                            "filename": "compute tool",
-                            "collection": "computed",
-                        })
+                        chunks.append({"text": text, "file_id": file_id, "filename": f"{file_id} pp{page_start}-{page_end}", "collection": "investment"})
+
+            elif tool_name == "compute" and facts:
+                text = await compute.ainvoke(
+                    {"question": query, "data": str(facts)[:2000]},
+                    config=config,
+                )
+                if text:
+                    chunks.append({"text": text, "file_id": "computed", "filename": "compute tool", "collection": "computed"})
+
         except Exception as exc:
-            logger.warning("_dispatch_one %s failed: %s", tool, str(exc)[:80])
+            logger.warning("_dispatch_one %s failed: %s", tool_name, str(exc)[:80])
 
         return chunks, web_count
 
@@ -332,7 +325,6 @@ async def run_investigation(
     claim: dict,
     model: str,
     *,
-    tools: Any = None,
     config: Any = None,
     max_iterations: int = MAX_INVESTIGATION_ITERATIONS,
 ) -> InvestigationResult:
@@ -363,16 +355,16 @@ async def run_investigation(
 
     for iteration in range(max_iterations):
         try:
-            output: InvestigationActionsOutput = await acall_llm(
+            output: InvestigationActionsOutput = await acall_structured(
                 prompt,
                 system_msg=system_msg,
                 model=model,
-                output_schema=InvestigationActionsOutput,
+                schema=InvestigationActionsOutput,
                 max_tokens=DEFAULT_MAX_TOKENS,
                 config=config,
             )
         except Exception as exc:
-            logger.warning("run_investigation acall_llm failed iteration %d: %s", iteration, exc)
+            logger.warning("run_investigation acall_structured failed iteration %d: %s", iteration, exc)
             break
 
         final_output = output
@@ -400,7 +392,7 @@ async def run_investigation(
             break
 
         new_chunks, wc = await _execute_actions(
-            actions, tools, inv_id, bow_id, model
+            actions, config, inv_id, bow_id, model
         )
         web_searches += wc
         new_chunks = _dedup_chunks(new_chunks, accumulated_chunks)
@@ -424,7 +416,13 @@ async def run_investigation(
 
     elapsed = time.time() - t0
 
-    # Build annotated excerpts with credibility tier; dedup by 80-char prefix
+    # Build annotated excerpts; dedup by 80-char prefix.
+    # Each dict carries both the new pipeline fields (text, source, credibility_tier,
+    # link_id) AND the old-schema fields expected by downstream consumers
+    # (excerpt_id, quote, source_file, source_type, type, context_needed) so
+    # deliver.py can write a CSV that matches the legacy 13-column format.
+    import re as _re_inv
+
     _CREDIBILITY_TIER = {
         "progress_report": "tier1_primary",
         "budget": "tier1_primary",
@@ -434,28 +432,38 @@ async def run_investigation(
         "strategy": "tier3_context",
         "external": "tier3_context",
     }
+    _answered = final_output.status == "answered"
     seen_prefixes: set[str] = set()
     annotated_excerpts: list[dict] = []
-    for c in accumulated_chunks:
+    for i, c in enumerate(accumulated_chunks):
         text = c.get("text", "")
         prefix = text[:80]
         if prefix in seen_prefixes:
             continue
         seen_prefixes.add(prefix)
         doc_type = c.get("doc_type", "")
+        source = c.get("filename", c.get("file_id", ""))
         credibility_tier = _CREDIBILITY_TIER.get(doc_type, "tier2_secondary")
-        import re as _re_inv
         numerical_facts = _re_inv.findall(r'\$[\d,]+(?:\.\d+)?(?:\s*[MBK])?|\d+(?:\.\d+)?%', text)
+        safe_link = link_id[:20].replace(" ", "_") if link_id else "lnk"
         annotated_excerpts.append({
+            # ── new pipeline fields ──────────────────────────────────────────
             "text": text[:500],
-            "source": c.get("filename", c.get("file_id", "")),
-            "page": c.get("page_start", 0),
-            "significance": "supporting" if final_output.status == "answered" else "background",
-            "numerical_facts": numerical_facts[:5],
+            "source": source,
             "credibility_tier": credibility_tier,
             "inv_id": inv_id,
             "scope_id": scope_id,
             "link_id": link_id,
+            # ── old-schema fields (CSV compat with legacy 13-column format) ──
+            "excerpt_id": f"EX-{inv_id}-{safe_link}-{i:03d}",
+            "source_file": source,
+            "page": c.get("page_start", 0),
+            "source_type": c.get("collection", doc_type),
+            "type": "evidence" if _answered else "context",
+            "quote": text[:500],
+            "significance": "supporting" if _answered else "background",
+            "context_needed": credibility_tier != "tier1_primary",
+            "numerical_facts": numerical_facts[:5],
         })
 
     return InvestigationResult(

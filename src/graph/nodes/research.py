@@ -30,9 +30,11 @@ async def research(state: WorkflowState, config: RunnableConfig) -> dict:
 
     result = await research_graph.ainvoke(research_input, config)
 
+    research_results = result.get("research_results") or []
     return {
         "research_dir": research_dir,
-        "research_results": result.get("research_results") or [],
+        "research_results": research_results,
+        "research_ok_count": sum(1 for r in research_results if r.get("status") == "ok"),
         "slr_traces": result.get("slr_traces") or [],
         "lbd_traces": result.get("lbd_traces") or [],
         "deep_web_traces": result.get("deep_web_traces") or [],

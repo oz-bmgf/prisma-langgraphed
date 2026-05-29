@@ -176,7 +176,6 @@ def test_cancelled_error_is_reraised_in_api():
 
 def test_deep_web_primary_timeout_pattern():
     """deep_web_try_primary must use asyncio.wait_for (APPROVED-3)."""
-    # Canonical implementation moved to subgraphs/deep_web.py; agents/ shim re-exports
     path = SRC_DIR / "graph" / "subgraphs" / "deep_web.py"
     source = path.read_text(encoding="utf-8")
     assert "asyncio.wait_for" in source, (
@@ -210,12 +209,12 @@ def test_all_llm_nodes_have_state_guards():
             "agent_rounds",
         ),
         (
-            SRC_DIR / "graph" / "agents" / "deep_web_graph.py",
+            SRC_DIR / "graph" / "subgraphs" / "deep_web.py",
             "deep_web_search_round",
             'state.get("result")',
         ),
         (
-            SRC_DIR / "graph" / "agents" / "edison_graph.py",
+            SRC_DIR / "graph" / "subgraphs" / "edison.py",
             "edison_search",
             'state.get("papers")',
         ),

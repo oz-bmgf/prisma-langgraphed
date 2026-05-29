@@ -17,8 +17,7 @@ def _make_state(**overrides) -> dict:
         "research_plan": [
             {"id": "RQ-001", "query": "Q1", "type": "slr", "priority": "important", "linked_scope": "S1"},
         ],
-        "output_dir": "/tmp/output",
-        "threads_dir": None,
+        "threads_dir": "/tmp/output",
     }
     base.update(overrides)
     return base
@@ -26,8 +25,10 @@ def _make_state(**overrides) -> dict:
 
 _MOCK_RESULT = {
     "research_results": [{"task_id": "RQ-001", "status": "ok", "findings": "..."}],
-    "dispatch_results": [{"task_id": "RQ-001", "findings": "..."}],
-    "edison_results": [],
+    "slr_traces": [],
+    "lbd_traces": [],
+    "deep_web_traces": [],
+    "edison_traces": [],
     "errors": [],
 }
 
@@ -68,9 +69,11 @@ async def test_returns_expected_keys():
 
     assert "research_dir" in result
     assert "research_results" in result
-    assert "dispatch_results" in result
-    assert "edison_results" in result
     assert "research_ok_count" in result
+    assert "slr_traces" in result
+    assert "lbd_traces" in result
+    assert "deep_web_traces" in result
+    assert "edison_traces" in result
     assert "errors" in result
 
 
@@ -93,7 +96,7 @@ async def test_passes_correct_fields_to_subgraph():
 
     from unittest.mock import patch
     with patch.dict(sys.modules, {"src.graph.subgraphs.research": mock_module}):
-        await research(_make_state(output_dir="/tmp/out"), {})
+        await research(_make_state(threads_dir="/tmp/out"), {})
 
     assert captured["research_plan"][0]["id"] == "RQ-001"
     assert captured["research_dir"].endswith("/research")
@@ -133,7 +136,8 @@ async def test_counts_ok_results():
 async def test_empty_plan_works():
     mock_graph = MagicMock()
     mock_graph.ainvoke = AsyncMock(return_value={
-        "research_results": [], "dispatch_results": [], "edison_results": [], "errors": []
+        "research_results": [], "slr_traces": [], "lbd_traces": [],
+        "deep_web_traces": [], "edison_traces": [], "errors": [],
     })
     mock_module = MagicMock()
     mock_module.research_graph = mock_graph

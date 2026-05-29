@@ -1,10 +1,11 @@
-"""Async Asta (Semantic Scholar MCP) client with Semantic Scholar public API fallback.
+"""Async Asta (Semantic Scholar MCP) client with cascading fallbacks.
 
-Primary path  : POST JSON-RPC 2.0 to ASTA_ENDPOINT with Bearer token.
-                Uses MCP Streamable HTTP — requires Accept: application/json, text/event-stream.
-                Tool: search_papers_by_relevance (keyword=), returns paperId+title only.
-                IDs are then enriched via SS batch API to add abstract/authors/year.
-Fallback path : Semantic Scholar public graph API (no key required).
+Primary path   : POST JSON-RPC 2.0 to ASTA_ENDPOINT with Bearer token.
+                 Uses MCP Streamable HTTP — requires Accept: application/json, text/event-stream.
+                 Tool: search_papers_by_relevance (keyword=), returns paperId+title only.
+                 IDs are then enriched via SS batch API to add abstract/authors/year.
+Fallback 1     : Semantic Scholar public graph API (x-api-key if SEMANTIC_SCHOLAR_API_KEY set).
+Fallback 2     : OpenAlex (via OpenAlexClient) — no key required, generous rate limits.
 
 Returns paper dicts with paperId, title, year, authors, abstract, url, source,
 externalIds — same schema as OpenAlexClient.search().
@@ -21,7 +22,7 @@ import urllib.request
 
 import httpx
 
-from src.config import ASTA_API_KEY, ASTA_ENDPOINT
+from src.config import ASTA_API_KEY, ASTA_ENDPOINT, ASTA_TIMEOUT_SECONDS, SEMANTIC_SCHOLAR_API_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -52,19 +53,35 @@ class AstaClient:
         self._endpoint = endpoint or ASTA_ENDPOINT
 
     async def search(self, query: str, max_results: int = 50) -> list[dict]:
-        """Search for papers. Falls back to Semantic Scholar if Asta is unavailable."""
+        """Search for papers. Falls back to Semantic Scholar, then OpenAlex."""
         if self._api_key:
             try:
                 results = await self._search_asta(query, max_results)
                 if results:
                     return results
-                # Empty result from ASTA — fall through to SS for better recall
                 logger.debug("ASTA returned 0 results, falling back to Semantic Scholar")
             except Exception as exc:
                 logger.warning(
                     "Asta MCP search failed, falling back to Semantic Scholar: %s", exc
                 )
-        return await self._search_semantic_scholar(query, max_results)
+        try:
+            results = await self._search_semantic_scholar(query, max_results)
+            if results:
+                return results
+            logger.debug("Semantic Scholar returned 0 results, falling back to OpenAlex")
+        except Exception as exc:
+            logger.warning(
+                "Semantic Scholar search failed, falling back to OpenAlex: %s", exc
+            )
+        return await self._search_openalex(query, max_results)
+
+    async def _search_openalex(self, query: str, max_results: int) -> list[dict]:
+        from src.core.agents.openalex import OpenAlexClient
+        try:
+            return await OpenAlexClient().search(query, max_results=max_results)
+        except Exception as exc:
+            logger.warning("OpenAlex fallback search failed: %s", exc)
+            return []
 
     async def _search_asta(self, query: str, max_results: int) -> list[dict]:
         # MCP Streamable HTTP requires both application/json and text/event-stream
@@ -83,7 +100,7 @@ class AstaClient:
             "Accept": "application/json, text/event-stream",
             "Authorization": f"Bearer {self._api_key}",
         }
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=ASTA_TIMEOUT_SECONDS) as client:
             resp = await client.post(self._endpoint, json=payload, headers=headers)
             resp.raise_for_status()
             sse_body = resp.text  # Content-Type is text/event-stream
@@ -121,13 +138,16 @@ class AstaClient:
         """Fetch full metadata (abstract, authors, year) for paper IDs via SS batch API."""
         def _fetch() -> list[dict]:
             body = json.dumps({"ids": paper_ids}).encode()
+            headers: dict[str, str] = {
+                "Content-Type": "application/json",
+                "User-Agent": "nqpr-pipeline/1.0",
+            }
+            if SEMANTIC_SCHOLAR_API_KEY:
+                headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
             req = urllib.request.Request(
                 f"{_SS_BATCH_BASE}?fields={_SS_FIELDS}",
                 data=body,
-                headers={
-                    "Content-Type": "application/json",
-                    "User-Agent": "nqpr-pipeline/1.0",
-                },
+                headers=headers,
                 method="POST",
             )
             with urllib.request.urlopen(req, timeout=20) as resp:
@@ -169,9 +189,10 @@ class AstaClient:
                 f"&fields={_SS_FIELDS}"
                 f"&limit={min(limit, 100)}"
             )
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "nqpr-pipeline/1.0"}
-            )
+            headers: dict[str, str] = {"User-Agent": "nqpr-pipeline/1.0"}
+            if SEMANTIC_SCHOLAR_API_KEY:
+                headers["x-api-key"] = SEMANTIC_SCHOLAR_API_KEY
+            req = urllib.request.Request(url, headers=headers)
             try:
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     return json.loads(resp.read()).get("data") or []

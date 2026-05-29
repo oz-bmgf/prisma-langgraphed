@@ -17,7 +17,7 @@ from langgraph.types import Send
 from src.graph.subgraphs.analyze import (
     analyze_graph,
     collect_timeline_narratives,
-    dispatch_timeline_narratives,
+    dispatch_investment_narratives,
     orientation,
     run_causal_pipeline,
 )
@@ -323,7 +323,7 @@ async def test_analyze_scope_fan_out(
     mock_investment_scoring,
     mock_bow_investment_map,
 ):
-    """dispatch_timeline_narratives returns 2 Send objects for 2 scopes."""
+    """dispatch_investment_narratives returns 2 Send objects for 2 scopes (fallback path)."""
     scopes = [
         {"scope_id": "scope_0000", "inv_id": "INV-001", "bow_ids": ["BOW-01"]},
         {"scope_id": "scope_0001", "inv_id": "INV-002", "bow_ids": ["BOW-01"]},
@@ -334,12 +334,12 @@ async def test_analyze_scope_fan_out(
         "synthesis_model": "claude-sonnet-4-6",
     }
 
-    sends = await dispatch_timeline_narratives(state)
+    sends = await dispatch_investment_narratives(state)
 
     assert isinstance(sends, list)
     assert len(sends) == 2
     assert all(isinstance(s, Send) for s in sends)
-    assert all(s.node == "generate_scope_narrative" for s in sends)
+    assert all(s.node == "generate_investment_narrative" for s in sends)
 
 
 # ---------------------------------------------------------------------------
@@ -396,11 +396,11 @@ async def test_analyze_causal_subgraph_integration(
     }
 
     with patch("src.graph.subgraphs.causal.acall_llm", side_effect=_mock_acall_llm), \
-         patch("src.core.causal_model.acall_llm", side_effect=_mock_acall_llm), \
-         patch("src.core.investigation.acall_llm", side_effect=_mock_acall_llm), \
-         patch("src.core.rubric_evaluator.acall_llm", side_effect=_mock_acall_llm), \
-         patch("src.core.science_investigator.acall_llm", side_effect=_mock_acall_llm), \
-         patch("src.core.decision_projection.acall_llm", side_effect=_mock_acall_llm):
+         patch("src.core.causal_model.acall_structured", side_effect=_mock_acall_llm), \
+         patch("src.core.investigation.acall_structured", side_effect=_mock_acall_llm), \
+         patch("src.core.rubric_evaluator.acall_structured", side_effect=_mock_acall_llm), \
+         patch("src.core.science_investigator.acall_structured", side_effect=_mock_acall_llm), \
+         patch("src.core.decision_projection.acall_structured", side_effect=_mock_acall_llm):
         result = await run_causal_pipeline(state)
 
     assert result.get("scope_outputs") is not None

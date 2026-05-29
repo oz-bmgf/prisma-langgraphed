@@ -93,7 +93,7 @@ async def test_rank_assumptions_sorts_by_risk_rank():
         ]
     )
 
-    with patch("src.core.causal_model.acall_llm", new=AsyncMock(return_value=mock_output)):
+    with patch("src.core.causal_model.acall_structured", new=AsyncMock(return_value=mock_output)):
         result = await rank_assumptions(cm, model="claude-haiku-4-5-20251001")
 
     assert len(result.assumptions) == 2
@@ -120,7 +120,7 @@ async def test_rank_assumptions_sets_risk_rank_from_matrix():
             )
         ]
     )
-    with patch("src.core.causal_model.acall_llm", new=AsyncMock(return_value=mock_output)):
+    with patch("src.core.causal_model.acall_structured", new=AsyncMock(return_value=mock_output)):
         result = await rank_assumptions(cm, model="claude-haiku-4-5-20251001")
 
     expected_rank = _RISK_MATRIX[("major", "moderate")][1]
@@ -156,7 +156,7 @@ async def test_forecast_consequences_clips_at_approved_amount():
     scoring = {"approved_amount": 5_000_000.0}
     timeline = {"duration_months": 24}
 
-    with patch("src.core.causal_model.acall_llm", new=AsyncMock(return_value=mock_output)):
+    with patch("src.core.causal_model.acall_structured", new=AsyncMock(return_value=mock_output)):
         result = await forecast_consequences(
             cm, scoring=scoring, timeline=timeline, model="claude-haiku-4-5-20251001"
         )
@@ -178,7 +178,7 @@ async def test_forecast_consequences_uses_max_not_sum():
     scoring = {"approved_amount": 1_000_000.0}
     timeline = {"duration_months": 36}
 
-    with patch("src.core.causal_model.acall_llm", new=AsyncMock(return_value=mock_output)):
+    with patch("src.core.causal_model.acall_structured", new=AsyncMock(return_value=mock_output)):
         result = await forecast_consequences(
             cm, scoring=scoring, timeline=timeline, model="claude-haiku-4-5-20251001"
         )
@@ -192,7 +192,7 @@ async def test_forecast_consequences_handles_llm_failure_gracefully():
         inv_id="INV-006",
         links=[CausalLink(name="X→Z", from_stage="ACTIVITIES", to_stage="IMPACT")],
     )
-    with patch("src.core.causal_model.acall_llm", new=AsyncMock(side_effect=RuntimeError("LLM down"))):
+    with patch("src.core.causal_model.acall_structured", new=AsyncMock(side_effect=RuntimeError("LLM down"))):
         result = await forecast_consequences(
             cm, scoring={"approved_amount": 500_000.0}, timeline={"duration_months": 12},
             model="claude-haiku-4-5-20251001",

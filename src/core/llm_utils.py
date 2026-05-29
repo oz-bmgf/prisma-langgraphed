@@ -18,10 +18,11 @@ import threading
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any, Generator, TYPE_CHECKING
+from typing import Any, Generator, TypeVar
 
-if TYPE_CHECKING:
-    from pydantic import BaseModel
+from pydantic import BaseModel
+
+_SchemaT = TypeVar("_SchemaT", bound=BaseModel)
 
 # Eager imports — must happen before the event loop starts so LangChain's
 # first-time initialization (tokenizer/cache dirs via os.mkdir) does not
@@ -168,38 +169,37 @@ async def acall_llm(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     images: list[dict] | None = None,
     thinking: bool = False,
-    output_schema: type | None = None,
     config: RunnableConfig | None = None,
     **kwargs,
-) -> Any:
+) -> str:
     """Async unified LLM call — routes to Anthropic or OpenAI by model prefix.
 
+    Returns plain text.  For structured (Pydantic) output use acall_structured().
+
     Args:
-        prompt:        User-turn text.
-        system_msg:    Optional system prompt.
-        model:         Model identifier (e.g. "claude-sonnet-4-6", "gpt-4o").
-        json_mode:     Deprecated — use output_schema for structured output instead.
-        max_tokens:    Maximum tokens in the response.
-        images:        Optional list of image content dicts appended to the user message.
-        thinking:      Enable extended thinking (Anthropic models only).
-        output_schema: Pydantic BaseModel subclass; triggers structured output mode.
-        **kwargs:      Passed through to the underlying LangChain chat model.
+        prompt:     User-turn text.
+        system_msg: Optional system prompt.
+        model:      Model identifier (e.g. "claude-sonnet-4-6", "gpt-4o").
+        json_mode:  Return parsed JSON dict instead of raw string (deprecated —
+                    prefer acall_structured with an explicit schema).
+        max_tokens: Maximum tokens in the response.
+        images:     Optional list of image content dicts appended to the user message.
+        thinking:   Enable extended thinking (Anthropic models only).
+        config:     LangGraph RunnableConfig for trace context propagation.
+        **kwargs:   Passed through to the underlying LangChain chat model.
 
     Returns:
-        str if no output_schema; BaseModel instance if output_schema is set;
-        dict if json_mode=True (deprecated).
+        str (or dict when json_mode=True).
     """
     if json_mode:
         logger.warning(
-            "acall_llm json_mode=True is deprecated; use output_schema=<PydanticModel> instead"
+            "acall_llm json_mode=True is deprecated; use acall_structured() with an explicit schema"
         )
 
-    # Build message list
     messages: list[Any] = []
     if system_msg:
         messages.append(SystemMessage(content=system_msg))
 
-    # Build human message (with optional image content)
     if images:
         content: Any = [{"type": "text", "text": prompt}] + images
     else:
@@ -211,12 +211,6 @@ async def acall_llm(
 
     try:
         llm = _build_llm(model, max_tokens=max_tokens, thinking=thinking, **kwargs)
-
-        if output_schema is not None:
-            structured = llm.with_structured_output(output_schema)
-            result = await structured.ainvoke(messages, config=config)
-            return result
-
         response = await llm.ainvoke(messages, config=config)
         text: str = response.content if hasattr(response, "content") else str(response)
 
@@ -228,6 +222,74 @@ async def acall_llm(
     except Exception as exc:
         error_msg = f"{type(exc).__name__}: {exc}"
         logger.warning("acall_llm failed (%s): %s", model, error_msg[:200])
+        raise
+    finally:
+        elapsed_ms = (time.time() - t0) * 1000
+        _log_trace_call(model=model, latency_ms=elapsed_ms, error=error_msg)
+
+
+async def acall_structured(
+    prompt: str,
+    system_msg: str = "",
+    *,
+    model: str,
+    schema: type[_SchemaT],
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+    images: list[dict] | None = None,
+    thinking: bool = False,
+    config: RunnableConfig | None = None,
+    **kwargs: Any,
+) -> _SchemaT:
+    """Async structured LLM call — returns a validated Pydantic model instance.
+
+    Routes to Anthropic or OpenAI by model prefix and delegates structured output
+    to LangChain's with_structured_output, letting each provider use its own
+    optimal strategy.
+
+    Args:
+        prompt:     User-turn text.
+        system_msg: Optional system prompt.
+        model:      Model identifier (e.g. "claude-sonnet-4-6", "gpt-4o").
+        schema:     Pydantic BaseModel subclass that defines the output shape.
+        max_tokens: Maximum tokens in the response.
+        images:     Optional list of image content dicts appended to the user message.
+        thinking:   Enable extended thinking (Anthropic only).
+        config:     LangGraph RunnableConfig for trace context propagation.
+        **kwargs:   Passed through to the underlying LangChain chat model.
+
+    Returns:
+        A validated instance of *schema*.
+    """
+    messages: list[Any] = []
+    if system_msg:
+        messages.append(SystemMessage(content=system_msg))
+
+    if images:
+        content: Any = [{"type": "text", "text": prompt}] + images
+    else:
+        content = prompt
+    messages.append(HumanMessage(content=content))
+
+    t0 = time.time()
+    error_msg: str | None = None
+
+    try:
+        llm = _build_llm(model, max_tokens=max_tokens, thinking=thinking, **kwargs)
+        # OpenAI's json_schema path (default for ChatOpenAI) wraps parsed responses
+        # in ParsedChatCompletion whose `parsed: None` field produces
+        # PydanticSerializationUnexpectedValue warnings during checkpointing.
+        # function_calling uses the tool-call path (PydanticToolsParser) which has
+        # no such wrapper.  Anthropic already defaults to function_calling.
+        so_kwargs: dict[str, Any] = {}
+        if any(model.startswith(p) for p in _OPENAI_PREFIXES):
+            so_kwargs["method"] = "function_calling"
+        structured = llm.with_structured_output(schema, **so_kwargs)
+        result: _SchemaT = await structured.ainvoke(messages, config=config)
+        return result
+
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        logger.warning("acall_structured failed (%s): %s", model, error_msg[:200])
         raise
     finally:
         elapsed_ms = (time.time() - t0) * 1000

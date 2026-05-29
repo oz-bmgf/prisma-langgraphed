@@ -54,7 +54,7 @@ async def search_asta(
     error_message = None
 
     try:
-        from src.core.asta_client import AstaClient  # lazy import — not available in all envs
+        from src.core.agents.asta import AstaClient  # lazy import — not available in all envs
         client = AstaClient(api_key=api_key)
         results = await client.search(query)
         result_count = len(results) if results else 0

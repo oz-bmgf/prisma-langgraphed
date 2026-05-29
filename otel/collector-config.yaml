@@ -1,12 +1,29 @@
-# OpenTelemetry Collector configuration.
+# ============================================================
+# SUPERSEDED — no longer used.
+#
+# Fan-out is now handled directly in observability/tracing.py
+# via separate BatchSpanProcessor + OTLPSpanExporter instances,
+# one per backend.  The otel-collector service has been removed
+# from docker-compose.yml.
+#
+# This file is kept for reference only.  If you need to restore
+# collector-based fan-out (e.g. for multi-service aggregation),
+# re-add the otel-collector service to docker-compose.yml and
+# set OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+# in the graph service environment block.
+# ============================================================
+#
+# Original OpenTelemetry Collector configuration.
 #
 # Receives spans from the graph process over gRPC/HTTP and fans them out to
-# LangSmith and the self-hosted Langfuse instance simultaneously.
+# LangSmith, self-hosted Langfuse, and self-hosted Phoenix simultaneously.
 #
 # Required environment variables (set in docker-compose.yml or .env):
 #   LANGCHAIN_API_KEY          — LangSmith API key (same key used for native tracing)
 #   LANGFUSE_OTEL_BASIC_AUTH   — base64(pk-lf-xxx:sk-lf-xxx)
 #                                Generate: echo -n "pk-lf-xxx:sk-lf-xxx" | base64
+#   PHOENIX_COLLECTOR_ENDPOINT — full OTLP/HTTP traces URL (includes /v1/traces path)
+#                                e.g. https://<host>/v1/traces
 
 receivers:
   otlp:
@@ -36,6 +53,12 @@ exporters:
       Authorization: Basic ${LANGFUSE_OTEL_BASIC_AUTH}
       x-langfuse-ingestion-version: "4"
 
+  # Phoenix — self-hosted OTLP endpoint.
+  # PHOENIX_COLLECTOR_ENDPOINT must be the full URL including /v1/traces.
+  # traces_endpoint is used (not endpoint) so the collector does not append /v1/traces again.
+  otlp_http/phoenix:
+    traces_endpoint: ${PHOENIX_COLLECTOR_ENDPOINT}
+
   # Debug logging — disable in production by removing from the pipeline below
   debug:
     verbosity: basic
@@ -45,4 +68,4 @@ service:
     traces:
       receivers: [otlp]
       processors: [batch]
-      exporters: [otlp_http/langsmith, otlp_http/langfuse, debug]
+      exporters: [otlp_http/langsmith, otlp_http/langfuse, otlp_http/phoenix, debug]
