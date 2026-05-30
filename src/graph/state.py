@@ -320,7 +320,8 @@ class WorkflowState(TypedDict):
     # ── Stage 5 outputs ────────────────────────────────────────────────────────
     final_report_wresearch_md_path: Optional[str]
     final_report_wresearch_md: Optional[str]
-    final_report_pdf_path: Optional[str]  # written by rerender (focused.pdf)
+    final_report_pdf_path: Optional[str]   # written by rerender (focused.pdf)
+    appendix_pdf_path: Optional[str]       # written by rerender (appendix.pdf)
     report_approved: Optional[bool]
 
     # ── Error / status ─────────────────────────────────────────────────────────
@@ -384,6 +385,7 @@ class AnalyzeState(TypedDict):
     investment_narrative_results: Annotated[list[dict], operator.add]  # per-investment; feeds dispatch_scope_syntheses
     timeline_narrative_results: Annotated[list[dict], operator.add]
     all_excerpts: Annotated[list[dict], operator.add]   # top-10 per link by credibility_tier desc, ~50 chars each
+    timeline_cache_hash: Optional[str]   # F-025: SHA256 hash of scope timeline structural data for cross-run cache
 
     # ── Tool call traces (accumulated across all nodes) ────────────────────────
     asta_traces: Annotated[list[dict], operator.add]
@@ -408,6 +410,9 @@ class CausalState(TypedDict):
     scope_timelines: dict
     research_model: str
     synthesis_model: str
+    program_context: Optional[dict]    # portfolio theory-of-change; forwarded from AnalyzeState (F-001)
+    ingested_dir: str                  # fallback for _get_tools when search_backend absent from config (e.g. langgraph dev)
+    collection_name: str               # fallback for _get_tools when search_backend absent from config
 
     # ── Fan-out reducer fields ──────────────────────────────────────────────────
     evidence_packs: Annotated[list[dict], operator.add]      # InvestmentEvidencePack per inv
@@ -430,6 +435,11 @@ class CausalState(TypedDict):
     # merge_scope_outputs reducer deep-merges by scope_id — safe for parallel
     # branches writing to different keys within each scope dict.
     scope_outputs: Annotated[list[dict], merge_scope_outputs]  # list[ScopeOutput], built progressively
+
+    # BOW-level causal models extracted in Phase 3.1a (Orphan 4).
+    # scope_id → {"theory_of_change", "links", "shared_assumptions", "investment_roles"}.
+    # Written once by extract_bow_causal_models; no reducer needed (single writer).
+    bow_causal_models: dict
 
     # Annotated excerpts accumulated from link investigations
     all_excerpts: Annotated[list[dict], operator.add]   # top-10 per link by credibility_tier desc

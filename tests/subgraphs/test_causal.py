@@ -601,19 +601,46 @@ async def test_collect_science_results_attaches_to_scopes():
 
 
 async def test_necessity_check_calls_acall_llm_per_scope():
+    """necessity_check runs the 2-turn DISCOVER+VERIFY web-search loop per scope.
+
+    Turn 1: search_web → acall_llm (parse candidates JSON)
+    Turn 2: acall_llm (verify differentiation → structured JSON)
+    Result: necessity_assessment is a JSON string with differentiation/confidence fields.
+    """
+    import json as _json
+
     scope_outputs = [
-        {"scope_id": "S1", "link_assessments": [{"status": "confirmed"}]},
-        {"scope_id": "S2", "link_assessments": [{"status": "weak"}]},
+        {"scope_id": "S1", "link_assessments": [{"link_name": "A→B", "status": "confirmed"}]},
+        {"scope_id": "S2", "link_assessments": [{"link_name": "C→D", "status": "weak"}]},
     ]
     state = _base_state(scope_outputs=scope_outputs)
 
-    mock_acall = AsyncMock(return_value="necessity assessment")
-    with patch("src.graph.subgraphs.causal.acall_llm", mock_acall):
+    # Turn 1 discover: search_web returns raw text; acall_llm parses into candidates JSON
+    discover_json = '{"candidates": [{"name": "BARDA Program", "funder": "US", "maturity_stage": "early", "source": "https://example.com"}]}'
+    # Turn 2 verify: acall_llm returns structured assessment JSON
+    verify_json = '{"differentiation": "high", "marginal_contribution": "medium", "portfolio_relationship": "complementary", "confidence": "medium", "sources": ["https://example.com"]}'
+
+    # acall_llm is called twice per scope: once for discover parse, once for verify
+    mock_acall = AsyncMock(side_effect=[discover_json, verify_json, discover_json, verify_json])
+    mock_search_web = AsyncMock(return_value="search results text")
+
+    with (
+        patch("src.graph.subgraphs.causal.acall_llm", mock_acall),
+        patch("src.tools.investigation_tools.search_web", mock_search_web),
+    ):
         result = await necessity_check(state)
 
-    assert mock_acall.call_count == 2
+    # 2 scopes × 2 acall_llm calls (discover parse + verify) = 4 total
+    assert mock_acall.call_count == 4
+    assert mock_search_web.call_count == 2
+
     for so in result["scope_outputs"]:
-        assert so["necessity_assessment"] == "necessity assessment"
+        na_str = so["necessity_assessment"]
+        assert na_str, f"scope {so['scope_id']} has empty necessity_assessment"
+        na = _json.loads(na_str)
+        assert na.get("differentiation") == "high"
+        assert na.get("portfolio_relationship") == "complementary"
+        assert na.get("confidence") == "medium"
 
 
 async def test_necessity_check_skips_empty_links():

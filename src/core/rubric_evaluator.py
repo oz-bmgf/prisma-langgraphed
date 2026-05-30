@@ -23,6 +23,7 @@ from typing import Any
 from src.config import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_SYNTHESIS_MODEL,
+    RUBRIC_TOP_K,
     TOP_K_DEFAULT,
 )
 from src.core.evidence_model import InvestmentEvidencePack
@@ -78,7 +79,7 @@ async def build_evidence_pack(
     scope_id: str,
     timeline: dict,
     *,
-    top_k: int = TOP_K_DEFAULT,
+    top_k: int = RUBRIC_TOP_K,  # 200 — matches OLD default; must be >> _MIN_STRATEGY_CHUNKS
     tools: Any = None,
     model: str = DEFAULT_SYNTHESIS_MODEL,
 ) -> InvestmentEvidencePack:

@@ -24,9 +24,14 @@ def bool_env(key: str, default: bool) -> bool:
 phoenix_enabled  = bool_env("PHOENIX_TRACING_ENABLED", True)
 langfuse_enabled = bool_env("LANGFUSE_TRACING_ENABLED", True)
 
-pub  = required("LANGFUSE_PUBLIC_KEY")
-sec  = required("LANGFUSE_SECRET_KEY")
-langfuse_auth = base64.b64encode(f"{pub}:{sec}".encode()).decode()
+# Auth: prefer pre-built LANGFUSE_OTEL_BASIC_AUTH; fall back to building from key pair.
+langfuse_auth = ""
+if langfuse_enabled:
+    langfuse_auth = os.environ.get("LANGFUSE_OTEL_BASIC_AUTH", "").strip()
+    if not langfuse_auth:
+        pub = required("LANGFUSE_PUBLIC_KEY")
+        sec = required("LANGFUSE_SECRET_KEY")
+        langfuse_auth = base64.b64encode(f"{pub}:{sec}".encode()).decode()
 
 env  = Environment(loader=FileSystemLoader("/etc/otel"))
 tmpl = env.get_template("collector.config.yaml.j2")

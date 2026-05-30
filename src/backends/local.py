@@ -197,11 +197,23 @@ class LocalSearchIndex:
         vectors_path = path / "vectors.npy"
         vectors = np.load(vectors_path, mmap_mode="r")
 
-        # Integrity check: sqlite row count must match vectors shape
+        # Integrity check: sqlite row count must match vectors shape.
+        # After a rebuild, n_sqlite may still be < vectors.shape[0] due to duplicate
+        # chunk_ids in chunks.json being silently dropped by INSERT OR IGNORE.  We
+        # only re-trigger the rebuild when n_sqlite == 0 (completely empty) or when
+        # n_sqlite > vectors.shape[0] (impossible for a clean index — rebuild to fix).
         con = sqlite3.connect(str(sqlite_path))
         n_sqlite = con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         con.close()
-        if n_sqlite != vectors.shape[0]:
+        needs_rebuild = (n_sqlite == 0) or (n_sqlite > vectors.shape[0])
+        if not needs_rebuild and n_sqlite != vectors.shape[0]:
+            # Partial mismatch — likely duplicate chunk_ids in chunks.json were deduped.
+            logger.warning(
+                "chunks.sqlite has %d rows vs %d vectors — %d duplicate chunk_ids in "
+                "chunks.json were deduped; proceeding with %d-row index",
+                n_sqlite, vectors.shape[0], vectors.shape[0] - n_sqlite, n_sqlite,
+            )
+        if needs_rebuild:
             if not chunks_json.exists():
                 raise RuntimeError(
                     f"chunks.sqlite has {n_sqlite} rows but vectors.npy has "
@@ -216,6 +228,14 @@ class LocalSearchIndex:
             _build_sqlite_from_json(chunks_json, sqlite_path)
             _migrate_intelligence_label_to_role(sqlite_path)
             _migrate_add_strategy_columns(sqlite_path)
+            # Verify the rebuild produced rows — if still 0, chunks.json is likely corrupt.
+            con2 = sqlite3.connect(str(sqlite_path))
+            n_rebuilt = con2.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+            con2.close()
+            if n_rebuilt == 0:
+                raise RuntimeError(
+                    f"chunks.sqlite rebuild produced 0 rows — {chunks_json} may be corrupt"
+                )
 
         # Norms — load or recompute
         norms_path = path / "norms.npy"

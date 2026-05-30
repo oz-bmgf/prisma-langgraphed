@@ -1,22 +1,39 @@
-"""ScienceToolNode — InvestigationToolNode + search_asta.
+"""ScienceToolNode — 8-tool set for Phase 3.5d science assumption validation.
 
-Extends the investigation tool set with ASTA (Semantic Scholar) access
-for Phase 3.5d science validation. At least one search_asta call is
-required before the loop may terminate with status=evidence_gathered.
+Matches OLD science_investigator.py tool vocabulary: search_asta (external
+literature gate), search_bow / search_science / search_policy (scoped local
+collection), search_web, read_document, compute, read_section.
+
+Intentionally excludes submit_findings (conflicts with the science loop's
+own status=evidence_gathered termination protocol), and excludes the document
+navigation tools (list_documents, read_document_summary, get_document_structure)
+which are link-investigation-only helpers.
 
 Configurable keys: same as InvestigationToolNode.
   asta_api_key : str | None  — ASTA API key (falls back to ASTA_API_KEY env var)
+
+search_asta error handling mirrors old science_investigator._search_asta:
+  - ImportError (AstaClient missing): returns error message, marks success=False
+  - Runtime failure (server error, network): returns error message, marks success=False
+  - No Semantic Scholar fallback — matches old-repo behavior
 """
 from __future__ import annotations
 
 import logging
 import os
-from typing import Optional
 
 from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 
-from src.tools.investigation_tools import INVESTIGATION_TOOLS
+from src.tools.investigation_tools import (
+    compute,
+    read_document,
+    read_section,
+    search_bow,
+    search_policy,
+    search_science,
+    search_web,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,59 +90,14 @@ async def search_asta(
                 )
             result_text = "\n".join(lines)
     except ImportError:
-        pass
+        result_text = f"(ASTA unavailable — configure ASTA_API_KEY)\nquery: {query}"
+        success = False
+        error_message = "AstaClient not importable"
     except Exception as exc:
         logger.warning("ASTA search failed: %s", exc)
         result_text = f"(ASTA search failed: {exc})"
         success = False
         error_message = str(exc)
-
-    if not result_text:
-        # Fallback: use Semantic Scholar public API when AstaClient is unavailable
-        try:
-            import asyncio
-            import json
-            import urllib.parse
-            import urllib.request
-
-            def _fetch_semantic_scholar(q: str) -> str:
-                url = (
-                    "https://api.semanticscholar.org/graph/v1/paper/search"
-                    f"?query={urllib.parse.quote(q)}"
-                    "&fields=title,authors,year,abstract,externalIds"
-                    "&limit=5"
-                )
-                req = urllib.request.Request(url, headers={"User-Agent": "nqpr-pipeline/1.0"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    data = json.loads(resp.read())
-                return data
-
-            # asyncio-APPROVED-1: to_thread wraps blocking urllib.request Semantic Scholar call
-            raw_data = await asyncio.to_thread(_fetch_semantic_scholar, query)
-            papers = raw_data.get("data") or []
-            result_count = len(papers)
-            top_paper_ids = [p.get("paperId", "") for p in papers[:5]]
-            top_titles = [p.get("title", "") for p in papers[:5]]
-            if not papers:
-                result_text = f"(no Semantic Scholar results for: {query!r})"
-            else:
-                lines = [f"{len(papers)} papers for: {query!r}"]
-                for i, p in enumerate(papers, 1):
-                    authors = ", ".join(a.get("name", "") for a in (p.get("authors") or [])[:3])
-                    lines.append(
-                        f"\n[{i}] {p.get('title', '')} ({p.get('year', '?')})\n"
-                        f"    Authors: {authors}\n"
-                        f"    Abstract: {(p.get('abstract') or '')[:400]}"
-                    )
-                result_text = "\n".join(lines)
-        except Exception as exc:
-            logger.warning("Semantic Scholar fallback failed: %s", exc)
-            result_text = (
-                f"[ASTA/Semantic Scholar unavailable — configure ASTA_API_KEY or network]\n"
-                f"query: {query}"
-            )
-            success = False
-            error_message = str(exc)
 
     duration_ms = int((time.monotonic() - start) * 1000)
     append_to_buffer("asta_traces", {
@@ -138,7 +110,7 @@ async def search_asta(
         "result_count": result_count,
         "top_paper_ids": top_paper_ids,
         "top_titles": top_titles,
-        "index_used": "semantic_scholar",
+        "index_used": "asta",
     })
 
     return result_text
@@ -148,4 +120,16 @@ async def search_asta(
 # Exported tool list for ToolNode construction
 # ---------------------------------------------------------------------------
 
-SCIENCE_TOOLS = [search_asta] + list(INVESTIGATION_TOOLS)
+SCIENCE_TOOLS = [
+    search_asta,        # external literature — must call at least once (ASTA gate)
+    search_bow,         # sibling investments in same BOW
+    search_science,     # local science/lit docs (global scope, no inv filter)
+    search_policy,      # local WHO/policy docs (global scope, no inv filter)
+    search_web,         # recent developments, preprints, registry data
+    read_document,      # full page or section text
+    compute,            # arithmetic on verified facts
+    read_section,       # named section read
+    # Excluded: submit_findings (conflicts with evidence_gathered termination)
+    # Excluded: list_documents, read_document_summary, get_document_structure
+    #           (link-investigation nav tools; not needed for science loop)
+]

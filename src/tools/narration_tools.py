@@ -5,14 +5,17 @@ to search_collection from collection_tools. Tools are thin retrieval wrappers;
 no LLM calls inside tools except verify_claim (which routes through acall_llm).
 
 Configurable keys consumed:
-  search_backend       : SearchBackend instance
-  doc_list             : list[dict]  — document catalog
-  investment_scoring   : dict        — investment metadata keyed by inv_id
-  investment_intelligence : dict     — per-investment intelligence keyed by inv_id
-  scope_outputs        : dict        — scope_id → ScopeOutput dict (for evidence packs)
-  pages_dir            : str | None  — pages directory for read_primary_document
-  relevance_subset     : set[str] | None  — optional inv_id filter for narrators
-  verifier_model       : str | None  — model for verify_claim (defaults to env or fast model)
+  search_backend          : SearchBackend instance
+  doc_list                : list[dict]  — document catalog
+  investment_scoring      : dict        — investment metadata keyed by inv_id
+  investment_intelligence : dict        — per-investment intelligence keyed by inv_id
+  scope_outputs           : dict        — scope_id → ScopeOutput dict (for evidence packs)
+  pages_dir               : str | None  — pages directory for read_primary_document
+  relevance_subset        : set[str] | None  — optional inv_id filter for narrators
+  verifier_model          : str | None  — model for verify_claim (defaults to env or fast model)
+  all_excerpts            : list[dict]  — all_excerpts from causal pipeline (F-045 fallback)
+  narrator_budget         : int         — max tool calls per narrator session (F-046)
+  _narrator_call_counter  : list[int]   — shared mutable [calls_used] counter (F-046)
 """
 from __future__ import annotations
 
@@ -32,27 +35,88 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Budget enforcement helper (F-046)
+# ---------------------------------------------------------------------------
+
+_BUDGET_EXHAUSTED = "[budget exhausted — wrap up now]"
+
+
+def _use_budget(configurable: dict) -> bool:
+    """Decrement the narrator call counter. Returns False when budget exhausted."""
+    budget: int = configurable.get("narrator_budget") or 0
+    if budget <= 0:
+        return True  # no budget configured — no enforcement
+    counter: list[int] = configurable.get("_narrator_call_counter") or [0]
+    if counter[0] >= budget:
+        return False
+    counter[0] += 1
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 
 
 @tool
 async def list_filtered_investments(
+    posture: Optional[str] = None,
+    bow_id: Optional[str] = None,
+    divergence_severity: Optional[str] = None,
     config: RunnableConfig = None,
 ) -> str:
-    """List all investments in the current narrator's relevance scope.
+    """List investments in scope, optionally filtered by posture, BOW, or divergence severity.
 
-    Returns inv_id, title, approved amount, paid amount, allocation, and
-    posture for each investment. Call once at narrator start to confirm scope
-    before reasoning. Results are bounded to 100 investments.
+    Returns inv_id, title, approved amount, paid amount, allocation, posture,
+    and AI/team divergence for each investment. Call at narrator start to
+    identify relevant investments before reasoning. Bounded to 100 results.
+
+    Args:
+        posture:            Filter by posture (e.g. "program_critical", "pathway_altering",
+                            "efficiency_reducing", "on_track").
+        bow_id:             Filter to investments in a specific Bundle of Work.
+        divergence_severity: Filter by AI/team divergence ("high", "medium", "low", "aligned").
     """
     configurable = (config or {}).get("configurable", {})
+    if not _use_budget(configurable):
+        return _BUDGET_EXHAUSTED
+
     investment_scoring: dict = configurable.get("investment_scoring") or {}
     relevance_subset: Optional[set] = configurable.get("relevance_subset")
+    scope_outputs: dict = configurable.get("scope_outputs") or {}
 
     inv_ids = sorted(relevance_subset) if relevance_subset else sorted(investment_scoring.keys())
+
+    # --- F-044: Apply filters ---
+    if bow_id:
+        bow_inv_ids: set[str] = set()
+        for scope in scope_outputs.values():
+            if isinstance(scope, dict) and bow_id in (scope.get("bow_ids") or []):
+                bow_inv_ids.update(scope.get("inv_ids") or [])
+        inv_ids = [i for i in inv_ids if i in bow_inv_ids]
+
+    if posture:
+        inv_ids = [
+            i for i in inv_ids
+            if (investment_scoring.get(i) or {}).get("posture", "").lower() == posture.lower()
+        ]
+
+    if divergence_severity:
+        filtered_by_div: list[str] = []
+        for iid in inv_ids:
+            for scope in scope_outputs.values():
+                if isinstance(scope, dict):
+                    inv_report = scope.get("investment_report") or {}
+                    if (
+                        inv_report.get("divergence_severity", "").lower() == divergence_severity.lower()
+                        and iid in (scope.get("inv_ids") or [])
+                    ):
+                        filtered_by_div.append(iid)
+                        break
+        inv_ids = filtered_by_div
+
     if not inv_ids:
-        return "(no investments in scope)"
+        return "(no investments match the specified filters)"
 
     lines = [f"{len(inv_ids)} investments in scope:"]
     for iid in inv_ids[:100]:
@@ -60,12 +124,19 @@ async def list_filtered_investments(
         approved = float(inv.get("approved_amount", 0) or 0)
         paid = float(inv.get("paid_amount", 0) or 0)
         alloc = float(inv.get("allocation", 0) or 0)
-        posture = inv.get("posture", "") or ""
+        posture_val = inv.get("posture", "") or ""
         title = (inv.get("title", "") or "")[:60]
+        # Divergence from scope_outputs
+        div = ""
+        for scope in scope_outputs.values():
+            if isinstance(scope, dict) and iid in (scope.get("inv_ids") or []):
+                div = (scope.get("investment_report") or {}).get("divergence_severity", "")
+                break
+        div_str = f" div={div}" if div else ""
         lines.append(
             f"- {iid} ({title}) "
             f"approved=${approved / 1e6:.1f}M paid=${paid / 1e6:.1f}M "
-            f"alloc=${alloc / 1e6:.2f}M posture={posture}"
+            f"alloc=${alloc / 1e6:.2f}M posture={posture_val}{div_str}"
         )
     if len(inv_ids) > 100:
         lines.append(f"… (+{len(inv_ids) - 100} more, truncated)")
@@ -86,6 +157,9 @@ async def get_inv_metadata(
         inv_id: Investment identifier (e.g. "INV-041892").
     """
     configurable = (config or {}).get("configurable", {})
+    if not _use_budget(configurable):
+        return _BUDGET_EXHAUSTED
+
     investment_scoring: dict = configurable.get("investment_scoring") or {}
     investment_intelligence: dict = configurable.get("investment_intelligence") or {}
 
@@ -146,6 +220,8 @@ async def search_within_scope(
         inv_id: Optional investment filter; if omitted uses relevance_subset.
     """
     configurable = (config or {}).get("configurable", {})
+    if not _use_budget(configurable):
+        return _BUDGET_EXHAUSTED
     backend: SearchBackend = configurable["search_backend"]
     relevance_subset: Optional[set] = configurable.get("relevance_subset")
 
@@ -175,12 +251,14 @@ async def read_evidence_pack(
         inv_id: Investment identifier.
     """
     configurable = (config or {}).get("configurable", {})
+    if not _use_budget(configurable):
+        return _BUDGET_EXHAUSTED
     scope_outputs: dict = configurable.get("scope_outputs") or {}
     investment_scoring: dict = configurable.get("investment_scoring") or {}
     investment_intelligence: dict = configurable.get("investment_intelligence") or {}
 
     # Find scope body — scope_outputs is keyed by scope_id, each scope has
-    # per-investment content under its scope_output dict
+    # per-investment content under its scope_output dict (written by assemble_report node)
     for scope_id, scope in scope_outputs.items():
         if isinstance(scope, dict):
             inv_sections = scope.get("investment_sections") or {}
@@ -190,7 +268,19 @@ async def read_evidence_pack(
                 truncated = " […truncated…]" if len(body) > 6000 else ""
                 return f"=== Scope section body for {inv_id} (scope {scope_id}) ===\n{head}{truncated}"
 
-    # Fallback: metadata + intelligence
+    # F-045: Second fallback — filter all_excerpts (from link investigations) by inv_id
+    all_excerpts: list[dict] = configurable.get("all_excerpts") or []
+    inv_excerpts = [ex for ex in all_excerpts if ex.get("inv_id", "") == inv_id]
+    if inv_excerpts:
+        lines = [f"=== Evidence excerpts for {inv_id} ({len(inv_excerpts)} items) ==="]
+        for ex in inv_excerpts[:20]:
+            ref = ex.get("ref_id", ex.get("excerpt_id", ""))
+            src = ex.get("source_file", ex.get("source", ""))
+            text = ex.get("text", ex.get("quote", ""))[:400]
+            lines.append(f"\n[{ref}] {src}\n{text}")
+        return "\n".join(lines)
+
+    # Final fallback: metadata + intelligence
     inv = investment_scoring.get(inv_id) or {}
     inv_intel = investment_intelligence.get(inv_id) or {}
     if not inv and not inv_intel:
@@ -229,6 +319,8 @@ async def read_primary_document(
     from pathlib import Path
 
     configurable = (config or {}).get("configurable", {})
+    if not _use_budget(configurable):
+        return _BUDGET_EXHAUSTED
     pages_dir = configurable.get("pages_dir")
 
     if not pages_dir:
@@ -269,6 +361,8 @@ async def verify_claim(
                 looks up the evidence pack for this investment.
     """
     configurable = (config or {}).get("configurable", {})
+    if not _use_budget(configurable):
+        return _BUDGET_EXHAUSTED
     acall_llm = configurable.get("acall_llm")
     verifier_model = configurable.get("verifier_model") or os.environ.get(
         "NQPR_VERIFIER_MODEL", DEFAULT_FAST_MODEL

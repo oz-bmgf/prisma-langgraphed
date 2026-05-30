@@ -23,13 +23,15 @@ import asyncio
 import dataclasses
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Send
 
-from src.core.llm_utils import acall_llm
+from src.core.llm_utils import acall_llm, safe_parse_json
+from src.prompts.causal_prompts import NECESSITY_DISCOVER_SYSTEM, NECESSITY_VERIFY_SYSTEM
 from src.graph.state import (
     BowEnrichmentWorkerState,
     CausalState,
@@ -116,6 +118,42 @@ class _SearchBackendToolsBridge:
         self.compute = compute_fn
 
 
+def _inject_search_config(config: Any, state: Any, *, inv_id: str = "", bow_id: str = "") -> Any:
+    """Augment config["configurable"] with search_backend + per-link context.
+
+    Investigation tools (search_investment, search_portfolio, search_bow, …) all
+    read search_backend from config["configurable"].  When the graph runs through
+    langgraph dev / Studio, configurable only has thread_id — search_backend is
+    absent and every tool call returns "(search_backend not configured)".
+
+    This helper mirrors the on-demand backend construction in _get_tools() and
+    injects the result into a copy of the incoming config so the original is not
+    mutated.  A pre-existing search_backend is never overwritten.
+    """
+    configurable = dict((config or {}).get("configurable") or {})
+    if not configurable.get("search_backend"):
+        ingested_dir = configurable.get("ingested_dir") or (state or {}).get("ingested_dir", "")
+        collection_name = configurable.get("collection_name") or (state or {}).get("collection_name", "")
+        if ingested_dir and collection_name:
+            try:
+                from src.backends.factory import build_search_backend
+                configurable["search_backend"] = build_search_backend(ingested_dir, collection_name)
+            except Exception as exc:
+                logger.warning("_inject_search_config: could not build backend: %s", exc)
+    # Per-link context — only set if absent so a pre-configured value is respected
+    if inv_id and not configurable.get("inv_id"):
+        configurable["inv_id"] = inv_id
+    if bow_id and not configurable.get("bow_id"):
+        configurable["bow_id"] = bow_id
+    ingested_dir = configurable.get("ingested_dir") or (state or {}).get("ingested_dir", "")
+    if ingested_dir and not configurable.get("pages_dir"):
+        configurable["pages_dir"] = str(Path(ingested_dir) / "pages")
+    doc_list = (state or {}).get("doc_list")
+    if doc_list and not configurable.get("doc_list"):
+        configurable["doc_list"] = doc_list
+    return {**(config or {}), "configurable": configurable}
+
+
 def _get_tools(config: Any, state: Any = None) -> Any:
     """Wrap config's search_backend in _SearchBackendToolsBridge, or return None.
 
@@ -140,11 +178,15 @@ def _get_tools(config: Any, state: Any = None) -> Any:
                 return None
         else:
             return None
+    # Derive pages_dir: prefer configurable, fall back to {ingested_dir}/pages
+    pages_dir = configurable.get("pages_dir", "") or (
+        str(Path(ingested_dir) / "pages") if ingested_dir else ""
+    )
     return _SearchBackendToolsBridge(
         backend,
         web_search_fn=configurable.get("web_search_fn"),
         compute_fn=configurable.get("compute_fn"),
-        pages_dir=configurable.get("pages_dir", ""),
+        pages_dir=pages_dir,
     )
 
 
@@ -226,30 +268,37 @@ def _classify_scope_fit(scope_label: str, timeline: dict) -> tuple[str, str]:
 
 async def dispatch_rubric_evaluation(state: CausalState):
     research_model = state.get("research_model", "")
-    already_done = {pack.get("scope_id") for pack in state.get("evidence_packs", [])}
+    # F-049: dedup keyed by (scope_id, inv_id) — one Send per investment, not per scope
+    already_done = {
+        (pack.get("scope_id"), pack.get("inv_id"))
+        for pack in state.get("evidence_packs", [])
+    }
     sends: list[Send] = []
     for scope in state.get("scopes", []):
         scope_id = scope.get("scope_id", "")
-        if scope_id in already_done:
-            continue
-        inv_id = scope.get("inv_id", "")
         scope_tl = state.get("scope_timelines", {}).get(scope_id, {})
-        # Consumers (build_evidence_pack, _classify_scope_fit, compute_investment_facts)
-        # expect an InvestmentTimeline dict (has title/org/scoring), not a ScopeTimeline.
-        timeline = next(
-            (inv for inv in (scope_tl.get("investments") or []) if inv.get("inv_id") == inv_id),
-            scope_tl,  # fallback keeps backward compat when investments list is absent
-        )
-        sends.append(Send("evaluate_investment_rubric", {
-            "inv_id": inv_id,
-            "scope_id": scope_id,
-            "scope_label": scope.get("label", ""),
-            "timeline": timeline,
-            "result": None,
-            "research_model": research_model,
-            "ingested_dir": state.get("ingested_dir", ""),
-            "collection_name": state.get("collection_name", ""),
-        }))
+        # F-049: emit one Send per investment in the scope, not one per scope
+        inv_ids = scope.get("inv_ids") or ([scope.get("inv_id", "")] if scope.get("inv_id") else [])
+        for inv_id in inv_ids:
+            if not inv_id:
+                continue
+            if (scope_id, inv_id) in already_done:
+                continue
+            # Consumers expect an InvestmentTimeline dict (title/org/scoring), not a ScopeTimeline.
+            timeline = next(
+                (inv for inv in (scope_tl.get("investments") or []) if inv.get("inv_id") == inv_id),
+                scope_tl,  # fallback when investments list is absent
+            )
+            sends.append(Send("evaluate_investment_rubric", {
+                "inv_id": inv_id,
+                "scope_id": scope_id,
+                "scope_label": scope.get("label", ""),
+                "timeline": timeline,
+                "result": None,
+                "research_model": research_model,
+                "ingested_dir": state.get("ingested_dir", ""),
+                "collection_name": state.get("collection_name", ""),
+            }))
     return sends or "collect_evidence_packs"
 
 
@@ -334,6 +383,315 @@ async def collect_evidence_packs(state: CausalState) -> dict:
             logger.warning("evidence pack scope_id=%s not in scopes", scope_id)
 
     return {"scope_outputs": list(by_scope.values())}
+
+
+# ---------------------------------------------------------------------------
+# GROUP 1.25 — BOW Causal Model (Stages 3.1a and 3.1b) — Orphans 4 & 5
+# ---------------------------------------------------------------------------
+
+_BOW_CAUSAL_SYSTEM = (
+    "You are analyzing a global health investment portfolio for the "
+    "Bill & Melinda Gates Foundation. Extract the shared theory of change "
+    "for a group of investments that collectively pursue a strategic objective."
+)
+
+_BOW_CAUSAL_PROMPT = """\
+These {n_inv} investments all contribute to "{bow_label}" in the {program} program.
+
+PROGRAM THEORY OF CHANGE:
+{program_toc}
+
+INVESTMENTS (with per-investment summaries):
+{inv_text}
+
+Extract the SHARED theory of change — the causal chain from Foundation \
+funding to impact that these investments collectively pursue.
+
+Return JSON:
+{{
+  "theory_of_change": "BOW-level causal narrative (3-5 sentences)",
+  "links": [
+    {{
+      "name": "descriptive link name",
+      "from_stage": "stage A",
+      "to_stage": "stage B",
+      "mechanism": "how A leads to B",
+      "assumptions": ["key assumption"],
+      "failure_modes": ["what could go wrong"]
+    }}
+  ],
+  "shared_assumptions": ["assumptions spanning the whole chain"],
+  "investment_roles": {{
+    "INV-XXX": ["link name 1", "link name 2"]
+  }}
+}}"""
+
+
+async def extract_bow_causal_models(
+    state: CausalState, config: RunnableConfig = None
+) -> dict:
+    """Phase 3.1a — BOW-level causal model extraction (Orphan 4).
+
+    For each scope with >1 investment: synthesises a shared theory of change
+    from per-investment causal models produced by forecast_consequences.
+    Mirrors OLD causal_pipeline._phase31a_extract_bow_model.
+    """
+    import re as _re_bow
+    scope_outputs = list(state.get("scope_outputs") or [])
+    program_context = state.get("program_context") or {}
+    model = state.get("research_model") or ""
+    errors: list[str] = []
+
+    # Build a lookup: inv_id → causal_model for fast access
+    cm_by_inv: dict[str, dict] = {}
+    for s in scope_outputs:
+        cm = s.get("causal_model") or {}
+        for iid in (s.get("inv_ids") or [s.get("inv_id", "")]):
+            if iid and cm:
+                cm_by_inv[iid] = cm
+
+    bow_causal_models: dict[str, dict] = {}
+
+    for scope in scope_outputs:
+        scope_id = scope.get("scope_id", "")
+        inv_ids = scope.get("inv_ids") or [scope.get("inv_id", "")]
+        label = scope.get("label", scope_id)
+
+        if len(inv_ids) <= 1:
+            continue  # single-investment scope — skip BOW model
+
+        inv_lines: list[str] = []
+        for inv_id in sorted(inv_ids):
+            cm = cm_by_inv.get(inv_id) or {}
+            toc = (cm.get("theory_of_change") or "")[:200]
+            inv_lines.append(f"- {inv_id}: {toc or '(no narrative)'}")
+
+        prompt = _BOW_CAUSAL_PROMPT.format(
+            n_inv=len(inv_ids),
+            bow_label=label,
+            program=program_context.get("program", ""),
+            program_toc=(program_context.get("theory_of_change") or "")[:400],
+            inv_text="\n".join(inv_lines),
+        )
+        try:
+            raw = await acall_llm(prompt, system_msg=_BOW_CAUSAL_SYSTEM, model=model, config=config)
+            raw_str = raw if isinstance(raw, str) else str(raw)
+            m = _re_bow.search(r"\{.*\}", raw_str, _re_bow.DOTALL)
+            parsed: dict = json.loads(m.group(0)) if m else {}
+            bow_causal_models[scope_id] = parsed
+            logger.info(
+                "[%s] BOW causal model: %d links, %d investments mapped",
+                scope_id, len(parsed.get("links", [])), len(parsed.get("investment_roles", {})),
+            )
+        except Exception as exc:
+            logger.warning("[%s] BOW causal model extraction failed: %s", scope_id, exc)
+            errors.append(f"extract_bow_causal_models:{scope_id}:{exc}")
+
+    result: dict[str, Any] = {"bow_causal_models": bow_causal_models}
+    if errors:
+        result["errors"] = errors
+    return result
+
+
+def frame_investment_links(state: CausalState) -> dict:
+    """Phase 3.1b — Investment link mapping and framing (Orphan 5).
+
+    Case A: investment has causal links → tag with BOW mappings via word overlap.
+    Case B: investment has 0 links (extraction failed) → create investment-specific
+            framed links from BOW model so the investigation fan-out has claims.
+
+    Mirrors OLD causal_pipeline Phase 3.1b.
+    """
+    bow_causal_models = state.get("bow_causal_models") or {}
+    scope_outputs = list(state.get("scope_outputs") or [])
+
+    for scope in scope_outputs:
+        scope_id = scope.get("scope_id", "")
+        bow_model = bow_causal_models.get(scope_id)
+        if not bow_model:
+            continue
+
+        investment_roles: dict[str, list[str]] = bow_model.get("investment_roles", {})
+        bow_links: list[dict] = bow_model.get("links", [])
+        label = scope.get("label", scope_id)
+        causal_model: dict = scope.get("causal_model") or {}
+        inv_links: list[dict] = causal_model.get("links", [])
+
+        inv_ids = scope.get("inv_ids") or [scope.get("inv_id", "")]
+
+        for inv_id in inv_ids:
+            inv_bow_roles = investment_roles.get(inv_id, [])
+            if not inv_bow_roles:
+                continue
+
+            if inv_links:
+                # Case A: tag existing links with BOW link name via word overlap
+                bow_link_mappings: dict[str, list[str]] = causal_model.get("bow_link_mappings", {})
+                for inv_link in inv_links:
+                    inv_name = inv_link.get("name", "")
+                    inv_words = set(inv_name.lower().split())
+                    best, best_score = None, 0
+                    for role in inv_bow_roles:
+                        overlap = len(inv_words & set(role.lower().split()))
+                        if overlap > best_score:
+                            best_score, best = overlap, role
+                    if best:
+                        bow_link_mappings.setdefault(best, []).append(inv_name)
+                causal_model["bow_link_mappings"] = bow_link_mappings
+            else:
+                # Case B: create investment-specific links from BOW model
+                new_links: list[dict] = []
+                bow_link_mappings = {}
+                for role in inv_bow_roles:
+                    bl = next((lk for lk in bow_links if lk.get("name") == role), None)
+                    if bl:
+                        inv_name = f"{inv_id} contribution to: {role}"[:80]
+                        new_links.append({
+                            "name": inv_name,
+                            "from_stage": bl.get("from_stage", ""),
+                            "to_stage": bl.get("to_stage", ""),
+                            "mechanism": (
+                                f"Within '{label}', {inv_id} advances '{role}' by: "
+                                f"{bl.get('mechanism', '')[:200]}"
+                            ),
+                            "assumptions": bl.get("assumptions", []),
+                            "failure_modes": bl.get("failure_modes", []),
+                        })
+                        bow_link_mappings.setdefault(role, []).append(inv_name)
+                if new_links:
+                    causal_model["links"] = new_links
+                    causal_model["bow_link_mappings"] = bow_link_mappings
+                    logger.info(
+                        "[%s/%s] Created %d framed links from BOW model",
+                        scope_id, inv_id, len(new_links),
+                    )
+            scope["causal_model"] = causal_model
+
+    return {"scope_outputs": scope_outputs}
+
+
+async def investigate_orphan_links(
+    state: CausalState, config: RunnableConfig = None
+) -> dict:
+    """Phase 3.4b — Orphan BOW link investigation (Orphan 6).
+
+    Identifies BOW causal links with no funding investment and investigates
+    each gap: portfolio search + web search + LLM criticality assessment.
+    Appends orphan findings to link_assessments so synthesize_findings
+    can incorporate strategic gaps into the scope narrative.
+
+    Mirrors OLD causal_pipeline Phase 3.4b.
+    """
+    import re as _re_orph
+    bow_causal_models = state.get("bow_causal_models") or {}
+    scope_outputs = state.get("scope_outputs") or []
+    model = state.get("research_model") or ""
+    errors: list[str] = []
+    orphan_assessments: list[dict] = []
+
+    for scope in scope_outputs:
+        scope_id = scope.get("scope_id", "")
+        bow_model = bow_causal_models.get(scope_id)
+        if not bow_model:
+            continue
+
+        investment_roles: dict[str, list[str]] = bow_model.get("investment_roles", {})
+        bow_links: list[dict] = bow_model.get("links", [])
+        label = scope.get("label", scope_id)
+
+        # Identify unfunded links
+        funded_links: set[str] = set()
+        for roles in investment_roles.values():
+            funded_links.update(roles)
+        orphan_links = [lk for lk in bow_links if lk.get("name", "") not in funded_links]
+
+        if not orphan_links:
+            continue
+
+        logger.info("[%s] %d unfunded BOW links — investigating", scope_id, len(orphan_links))
+
+        for orphan_link in orphan_links:
+            link_name = orphan_link.get("name", "")
+            mechanism = orphan_link.get("mechanism", "")[:200]
+            search_query = f"{label}: {link_name} — {mechanism}"
+
+            # Portfolio search
+            portfolio_evidence = ""
+            try:
+                from src.tools.investigation_tools import search_portfolio
+                p_result = await search_portfolio.ainvoke(
+                    {"query": search_query, "top_k": 10},
+                    config=config,
+                )
+                portfolio_evidence = str(p_result)[:2000]
+            except Exception:
+                pass
+
+            # Web search
+            web_evidence = ""
+            try:
+                from src.tools.investigation_tools import search_web
+                w_result = await search_web.ainvoke(
+                    {"query": search_query, "rationale": "gap evidence for unfunded BOW link"},
+                    config=config,
+                )
+                if w_result and not w_result.startswith("[web search not configured"):
+                    web_evidence = str(w_result)[:2000]
+            except Exception:
+                pass
+
+            # LLM criticality assessment
+            gap_prompt = (
+                f"The BOW '{label}' has a theory of change with this UNFUNDED link:\n\n"
+                f"LINK: {link_name}\n"
+                f"From: {orphan_link.get('from_stage', '?')} → To: {orphan_link.get('to_stage', '?')}\n"
+                f"Mechanism: {mechanism}\n"
+                f"Assumptions: {orphan_link.get('assumptions', [])}\n\n"
+                f"No current Foundation investment funds this stage.\n\n"
+                f"PORTFOLIO EVIDENCE:\n{portfolio_evidence or '(none found)'}\n\n"
+                f"EXTERNAL EVIDENCE:\n{web_evidence or '(none found)'}\n\n"
+                "Assess this gap. Return JSON:\n"
+                '{"criticality": "critical|high|moderate|low", '
+                '"gap_acknowledged": true/false, '
+                '"external_coverage": "who else covers this or empty", '
+                '"risk_assessment": "what happens if unfunded", '
+                '"recommendation": "what leadership should consider"}'
+            )
+            try:
+                raw = await acall_llm(gap_prompt, model=model, config=config)
+                raw_str = raw if isinstance(raw, str) else str(raw)
+                m = _re_orph.search(r"\{.*\}", raw_str, _re_orph.DOTALL)
+                assessment: dict = json.loads(m.group(0)) if m else {}
+                orphan_assessments.append({
+                    "scope_id": scope_id,
+                    "link_id": f"ORPHAN:{scope_id}:{link_name[:30]}",
+                    "link_name": link_name,
+                    "from_stage": orphan_link.get("from_stage", ""),
+                    "to_stage": orphan_link.get("to_stage", ""),
+                    "mechanism": mechanism,
+                    "criticality": assessment.get("criticality", "unknown"),
+                    "gap_acknowledged": assessment.get("gap_acknowledged", False),
+                    "external_coverage": assessment.get("external_coverage", ""),
+                    "risk_assessment": assessment.get("risk_assessment", ""),
+                    "recommendation": assessment.get("recommendation", ""),
+                    "status": "not_answerable",
+                    "confidence": "low",
+                    "answer": assessment.get("risk_assessment", ""),
+                    "evidence_refs": [],
+                    "is_orphan_link": True,
+                })
+                logger.info(
+                    "[%s] Orphan link '%s': criticality=%s",
+                    scope_id, link_name[:40], assessment.get("criticality", "?"),
+                )
+            except Exception as exc:
+                logger.warning("[%s] Orphan link assessment failed for %s: %s", scope_id, link_name[:40], exc)
+                errors.append(f"investigate_orphan_links:{scope_id}:{link_name[:30]}:{exc}")
+
+    result: dict[str, Any] = {"link_assessments": orphan_assessments}
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -546,6 +904,12 @@ async def investigate_link(state: LinkInvestigationState, config: RunnableConfig
     scope_id = state["scope_id"]
 
     init_trace_buffer()
+
+    # Inject search_backend + per-link context into config so investigation tools
+    # can resolve search_backend from config["configurable"].  Without this,
+    # search_investment / search_portfolio / search_bow all return
+    # "(search_backend not configured)" and accumulated_chunks stays empty.
+    config = _inject_search_config(config, state, inv_id=state["inv_id"], bow_id=state.get("bow_id", ""))
 
     try:
         from src.core import investigation
@@ -800,6 +1164,10 @@ async def investigate_science_assumption(state: ScienceAssumptionState, config: 
 
     init_trace_buffer()
 
+    # Same search_backend injection as investigate_link — science tools also read
+    # search_backend from config["configurable"].
+    config = _inject_search_config(config, state, inv_id=state["inv_id"], bow_id=state.get("bow_id", ""))
+
     try:
         from src.core import science_investigator
         result = await science_investigator.investigate_science_question(
@@ -883,7 +1251,90 @@ async def collect_science_results(state: CausalState) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _coerce_necessity_payload(
+    parsed: dict,
+    known_fields: frozenset,
+    scope_id: str,
+    *,
+    web_searches_performed: int,
+    all_web_sources: list,
+    path_label: str,
+    fallback_confidence_floor: bool,
+) -> dict:
+    """Coerce raw LLM JSON into a necessity assessment dict.
+
+    Enforces two citation safeguards (mirrors old repo Phase 3.7):
+    1. CITATION RULE — remove unsourced named-program data when the LLM made
+       a differentiation/redundancy claim without providing source URLs.
+    2. NO BACKFILL FROM WEB-ENGINE CITES unless the LLM also provided sources.
+    """
+    coerced = {k: v for k, v in parsed.items() if k in known_fields}
+
+    llm_sources = list(coerced.get("sources") or [])
+    has_llm_sources = bool(llm_sources)
+    redundancy_text = coerced.get("redundancy_finding") or ""
+    has_redundancy_claim = redundancy_text.strip().lower() not in ("", "none identified")
+    differentiation = coerced.get("differentiation", "")
+    has_substantive_diff = differentiation in ("high", "low")
+
+    if not has_llm_sources and (has_substantive_diff or has_redundancy_claim):
+        logger.warning(
+            "[%s] necessity_check %s: LLM made differentiation/redundancy claim "
+            "without citing sources — clearing unverified named programs and "
+            "downgrading confidence",
+            scope_id,
+            path_label,
+        )
+        coerced["confidence"] = "low"
+        if has_redundancy_claim:
+            coerced["redundancy_finding"] = (
+                "(unverified: LLM named overlapping programs without source "
+                "citations; original text suppressed at type boundary)"
+            )
+        coerced["substitutes"] = []
+
+    if has_llm_sources:
+        existing = set(llm_sources)
+        for s in all_web_sources:
+            if s and s not in existing:
+                existing.add(s)
+        coerced["sources"] = list(existing)
+    else:
+        coerced["sources"] = []
+
+    subs = coerced.get("substitutes", []) or []
+    coerced["substitutes"] = [str(s) for s in subs if s] if isinstance(subs, list) else []
+
+    coerced["scope_id"] = scope_id
+    coerced["web_searches_performed"] = web_searches_performed
+    if fallback_confidence_floor:
+        coerced["confidence"] = "low"
+
+    return coerced
+
+
+_NECESSITY_KNOWN_FIELDS: frozenset = frozenset({
+    "differentiation", "differentiation_rationale", "redundancy_finding",
+    "counterfactual_loss", "marginal_contribution", "substitutes",
+    "portfolio_relationship", "failure_mode_independence", "confidence", "sources",
+})
+
+
 async def necessity_check(state: CausalState, config: RunnableConfig = None) -> dict:
+    """Phase 3.7 necessity check — 2-turn DISCOVER + VERIFY web-search loop.
+
+    For each scope:
+      Turn 1 (DISCOVER): web search for external programs on the same problem.
+      Turn 2 (VERIFY): compare investment against candidates → structured JSON.
+      Fallback: BoW-context-only assessment when Turn 1 finds no candidates or
+        Turn 2 fails. Always emits a necessity_assessment; confidence='low' on
+        fallback.
+
+    Stores assessment as JSON string on scope["necessity_assessment"].
+    Ported from old repo _phase37_necessity_check (causal_pipeline.py §3.7).
+    """
+    from src.tools.investigation_tools import search_web as _search_web
+
     scope_outputs = list(state.get("scope_outputs", []))
     model = state.get("synthesis_model", "")
     errors: list[str] = []
@@ -894,18 +1345,194 @@ async def necessity_check(state: CausalState, config: RunnableConfig = None) -> 
         if not link_assessments:
             scope["necessity_assessment"] = ""
             continue
+
+        # ── Build investment context ───────────────────────────────
+        inv_id = scope.get("inv_id", "") or scope_id
+        facts = scope.get("investment_facts") or {}
+        org = facts.get("org", "")
+        title = facts.get("title", "")
+        approved = facts.get("approved_amount", 0)
+
+        # Theory-of-change link name summary (mirrors old toc_summary)
+        toc_summary = "; ".join(
+            la.get("link_name", la.get("name", ""))
+            for la in link_assessments[:5]
+            if la.get("link_name") or la.get("name")
+        )
+        if not toc_summary:
+            causal_model = scope.get("causal_model") or {}
+            toc_links = causal_model.get("links", []) if isinstance(causal_model, dict) else []
+            toc_summary = "; ".join(lk.get("name", "") for lk in toc_links[:5] if lk.get("name"))
+
+        # BoW context block (mirrors old bc_summary)
+        bow_context = scope.get("bow_context") or {}
+        bc_parts: list[str] = []
+        if isinstance(bow_context, dict):
+            if bow_context.get("field_landscape"):
+                bc_parts.append(f"Field: {bow_context['field_landscape'][:600]}")
+            if bow_context.get("comparable_programs"):
+                bc_parts.append(
+                    "Already-identified comparable programs:\n  - "
+                    + "\n  - ".join(str(p) for p in bow_context["comparable_programs"][:5])
+                )
+            if bow_context.get("benchmarks"):
+                bm_lines = [str(b) for b in bow_context["benchmarks"][:3]]
+                bc_parts.append("Benchmarks (top 3):\n" + "\n".join(bm_lines))
+        bc_summary = "\n\n".join(bc_parts)
+
+        narrative_excerpt = (scope.get("synthesis") or "")[:800]
+
+        web_searches_performed = 0
+        all_sources: list[str] = []
+
+        # ── Turn 1: DISCOVER candidates (web search) ──────────────
+        candidates: list[dict] = []
         try:
-            prompt = (
-                f"Scope {scope_id}: assess necessity of each of {len(link_assessments)} "
-                "causal links for the investment's theory of change. "
-                "Return a concise necessity assessment."
+            discover_query = (
+                f"{org or inv_id} {title} comparable programs external funder "
+                f"alternative global health 2023 2024 2025"
             )
-            raw = await acall_llm(prompt, model=model, config=config)
-            scope["necessity_assessment"] = raw if isinstance(raw, str) else str(raw)
+            discover_rationale = (
+                f"Identify 2-5 external programs working on the same problem as {inv_id} "
+                "at comparable maturity for necessity/differentiation assessment."
+            )
+            search_result = await _search_web(discover_query, discover_rationale, config)
+            web_searches_performed += 1
+
+            discover_prompt = (
+                f"Investment: {inv_id} ({org}): {title} [${approved:,.0f}]\n"
+                f"Theory of change (link summary): {toc_summary}\n\n"
+                f"Key narrative excerpt:\n{narrative_excerpt}\n\n"
+                f"BoW context:\n{bc_summary or '(no BoW context available)'}\n\n"
+                f"Web search results:\n{search_result[:3000]}\n\n"
+                "Based on the web search results above, identify 2-5 EXTERNAL programs "
+                "working on the same problem at comparable maturity. Required: "
+                "named program, funder/host, source URL."
+            )
+            discover_raw = await acall_llm(
+                discover_prompt,
+                system_msg=NECESSITY_DISCOVER_SYSTEM,
+                model=model,
+                config=config,
+                max_tokens=1000,
+            )
+            parsed_d = safe_parse_json(discover_raw)
+            if not (isinstance(parsed_d, dict) and parsed_d.get("_parse_failed")):
+                raw_c = parsed_d.get("candidates", []) if isinstance(parsed_d, dict) else []
+                if isinstance(raw_c, list):
+                    candidates = [
+                        c for c in raw_c
+                        if isinstance(c, dict) and c.get("name") and c.get("source")
+                    ]
         except Exception as exc:
-            logger.error("necessity_check failed %s: %s", scope_id, exc)
+            logger.warning("[%s] necessity_check Turn 1 (discover) failed: %s", scope_id, str(exc)[:120])
+
+        # ── Turn 2: VERIFY differentiation (conditional on Turn 1) ──
+        verify_parsed: dict = {}
+        if candidates:
+            try:
+                cand_block = "\n".join(
+                    f"- {c.get('name', '?')} ({c.get('funder', '?')}, "
+                    f"{c.get('maturity_stage', '?')}): {c.get('source', '')}"
+                    for c in candidates[:5]
+                )
+                verify_prompt = (
+                    f"Investment: {inv_id} ({org}): {title} [${approved:,.0f}]\n"
+                    f"Theory of change: {toc_summary}\n\n"
+                    f"Narrative excerpt:\n{narrative_excerpt}\n\n"
+                    f"BoW context:\n{bc_summary}\n\n"
+                    f"Candidate external programs:\n{cand_block}\n\n"
+                    "Compare the investment against each candidate. Produce "
+                    "a NecessityAssessment per the system prompt. Cite source "
+                    "URLs for every named program."
+                )
+                verify_raw = await acall_llm(
+                    verify_prompt,
+                    system_msg=NECESSITY_VERIFY_SYSTEM,
+                    model=model,
+                    config=config,
+                    max_tokens=2000,
+                )
+                parsed_v = safe_parse_json(verify_raw)
+                if isinstance(parsed_v, dict) and not parsed_v.get("_parse_failed"):
+                    verify_parsed = parsed_v
+            except Exception as exc:
+                logger.warning("[%s] necessity_check Turn 2 (verify) failed: %s", scope_id, str(exc)[:120])
+
+        # ── Build assessment from Turn 2 result ───────────────────
+        if verify_parsed:
+            coerced = _coerce_necessity_payload(
+                verify_parsed,
+                _NECESSITY_KNOWN_FIELDS,
+                scope_id,
+                web_searches_performed=web_searches_performed,
+                all_web_sources=all_sources,
+                path_label="Turn 2",
+                fallback_confidence_floor=False,
+            )
+            scope["necessity_assessment"] = json.dumps(coerced)
+            logger.info(
+                "[%s] necessity_check complete (Turn 2): differentiation=%s, confidence=%s",
+                scope_id,
+                coerced.get("differentiation", "?"),
+                coerced.get("confidence", "?"),
+            )
+            continue
+
+        # ── Fallback: BoW-context-only assessment ─────────────────
+        try:
+            fallback_prompt = (
+                f"Investment: {inv_id} ({org}): {title} [${approved:,.0f}]\n"
+                f"Theory of change: {toc_summary}\n\n"
+                f"Narrative excerpt:\n{narrative_excerpt}\n\n"
+                f"BoW context (already-gathered field landscape and "
+                f"comparable programs — NO additional web search):\n"
+                f"{bc_summary or '(no BoW context available)'}\n\n"
+                "Produce a NecessityAssessment using ONLY the BoW context "
+                "above. Set confidence='low' since no external verification "
+                "search was completed. Do NOT fabricate program names not "
+                "already in the BoW context."
+            )
+            fb_raw = await acall_llm(
+                fallback_prompt,
+                system_msg=NECESSITY_VERIFY_SYSTEM,
+                model=model,
+                config=config,
+                max_tokens=2000,
+            )
+            fb_parsed = (
+                safe_parse_json(fb_raw) if isinstance(fb_raw, str)
+                else (fb_raw if isinstance(fb_raw, dict) else {})
+            )
+            if fb_parsed and not fb_parsed.get("_parse_failed"):
+                coerced = _coerce_necessity_payload(
+                    fb_parsed,
+                    _NECESSITY_KNOWN_FIELDS,
+                    scope_id,
+                    web_searches_performed=web_searches_performed,
+                    all_web_sources=all_sources,
+                    path_label="fallback",
+                    fallback_confidence_floor=True,
+                )
+                scope["necessity_assessment"] = json.dumps(coerced)
+                logger.info(
+                    "[%s] necessity_check complete (fallback): differentiation=%s",
+                    scope_id,
+                    coerced.get("differentiation", "?"),
+                )
+                continue
+        except Exception as exc:
+            logger.warning("[%s] necessity_check fallback failed: %s", scope_id, str(exc)[:120])
             errors.append(f"necessity:{scope_id}:{exc}")
-            scope["necessity_assessment"] = ""
+
+        # Last resort
+        scope["necessity_assessment"] = json.dumps({
+            "scope_id": scope_id,
+            "confidence": "low",
+            "differentiation_rationale": "(necessity check failed; defaulting to empty)",
+            "web_searches_performed": web_searches_performed,
+            "sources": [],
+        })
 
     result: dict[str, Any] = {"scope_outputs": scope_outputs}
     if errors:
@@ -996,6 +1623,11 @@ _builder = StateGraph(CausalState)
 _builder.add_node("evaluate_investment_rubric", evaluate_investment_rubric)
 _builder.add_node("collect_evidence_packs", collect_evidence_packs)
 
+# Nodes — Group 1.25 (BOW causal model + link framing + orphan investigation — Orphans 4–6)
+_builder.add_node("extract_bow_causal_models", extract_bow_causal_models)
+_builder.add_node("frame_investment_links", frame_investment_links)
+_builder.add_node("investigate_orphan_links", investigate_orphan_links)
+
 # Nodes — Group 1.5 (BOW context enrichment fan-out)
 # dispatch_bow_enrichment is a conditional-edge router, not a node
 _builder.add_node("enrich_bow_context_worker", enrich_bow_context_worker)
@@ -1041,10 +1673,15 @@ _builder.add_conditional_edges(
 )
 _builder.add_edge("evaluate_investment_rubric", "collect_evidence_packs")
 
-# Group 1.5 fan-out: collect_evidence_packs → dispatch_bow_enrichment → [enrich_bow_context_worker × N]
-#                                                                       → collect_bow_enrichment → forecast_consequences
+# Group 1.25 chain: collect_evidence_packs → extract_bow_causal_models → frame_investment_links
+# (Orphans 4 & 5): extract BOW-level theory-of-change, then tag/create per-investment links
+_builder.add_edge("collect_evidence_packs", "extract_bow_causal_models")
+_builder.add_edge("extract_bow_causal_models", "frame_investment_links")
+
+# Group 1.5 fan-out: frame_investment_links → dispatch_bow_enrichment → [enrich_bow_context_worker × N]
+#                                                                      → collect_bow_enrichment → forecast_consequences
 _builder.add_conditional_edges(
-    "collect_evidence_packs",
+    "frame_investment_links",
     dispatch_bow_enrichment,
     {
         "enrich_bow_context_worker": "enrich_bow_context_worker",
@@ -1067,13 +1704,17 @@ _builder.add_conditional_edges(
 )
 _builder.add_edge("investigate_link", "collect_link_assessments")
 
+# Orphan 6: investigate_orphan_links runs after collect_link_assessments before synthesis.
+# Appends orphan gap findings to link_assessments so synthesize_findings sees them.
+_builder.add_edge("collect_link_assessments", "investigate_orphan_links")
+
 # ── Parallel: synthesize_findings chain ∥ dispatch_science_investigations ────
-# Both read from collect_link_assessments:
-#   - synthesize_findings reads link_assessments (updated by collect_link_assessments)
-#   - dispatch_science_investigations reads causal_model.assumptions (from forecast_consequences)
+# Both read from investigate_orphan_links (which passes through to the same state):
+#   - synthesize_findings reads link_assessments (now includes orphan findings)
+#   - dispatch_science_investigations reads causal_model.assumptions
 # They write to completely different state keys — safe to run in parallel.
-_builder.add_edge("collect_link_assessments", "synthesize_findings")
-_builder.add_edge("collect_link_assessments", "dispatch_science_investigations")
+_builder.add_edge("investigate_orphan_links", "synthesize_findings")
+_builder.add_edge("investigate_orphan_links", "dispatch_science_investigations")
 
 # Synthesis chain (Branch 1):
 _builder.add_edge("synthesize_findings", "critique_synthesis")

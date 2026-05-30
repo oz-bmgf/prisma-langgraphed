@@ -28,12 +28,13 @@ TRACING_ENABLED              true (default) | false  — master on/off; false re
                              a NoOpTracerProvider and skips all OTEL export
 OTEL_SDK_DISABLED            true to disable (legacy kill-switch; same as TRACING_ENABLED=false)
 OTEL_SERVICE_NAME            service name on all spans (default: prisma-langgraphed)
-OTEL_EXPORTER_OTLP_ENDPOINT  gRPC endpoint for local collector
-                             (default: http://localhost:4317)
-OTEL_BSP_MAX_QUEUE_SIZE      2048   max spans buffered before dropping
+OTEL_EXPORTER_OTLP_ENDPOINT  HTTP/Protobuf base URL for local collector (SDK appends /v1/traces)
+                             (default: http://localhost:4318)
+OTEL_BSP_MAX_QUEUE_SIZE        4096  max spans buffered before dropping
 OTEL_BSP_SCHEDULE_DELAY_MILLIS 5000  export interval (ms)
-OTEL_BSP_MAX_EXPORT_BATCH_SIZE 512   spans per export request
+OTEL_BSP_MAX_EXPORT_BATCH_SIZE 1024  spans per export request
 OTEL_BSP_EXPORT_TIMEOUT_MILLIS 30000 per-request timeout (ms)
+OTEL_TRACES_SAMPLER_ARG        1.0   TraceIdRatioBased sample rate (0.0–1.0); 1.0 = keep all
 
 Collector-side env vars (read by otel/generate_config.py, not by this module)
 --------------
@@ -94,10 +95,12 @@ def init_tracing(service_name: Optional[str] = None) -> None:
 
     try:
         from opentelemetry import trace
-        from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry.sdk.resources import SERVICE_NAME, Resource
         from opentelemetry.sdk.trace import TracerProvider
         from opentelemetry.sdk.trace.export import BatchSpanProcessor
+        from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
+        from opentelemetry.exporter.otlp.proto.http import Compression
 
         # Idempotency: ProxyTracerProvider is the SDK default before the first
         # set_tracer_provider() call; any other type means we already initialised.
@@ -114,27 +117,40 @@ def init_tracing(service_name: Optional[str] = None) -> None:
                 "openinference.project.name": project_name,
             }
         )
-        provider = TracerProvider(resource=resource)
+
+        # Optional head-based sampling — set OTEL_TRACES_SAMPLER_ARG=0.25 to keep
+        # 25 % of traces (drop the rest at the root span).  ParentBased ensures
+        # child spans follow the root decision so traces are never split.
+        sampler_ratio = float(os.getenv("OTEL_TRACES_SAMPLER_ARG", "1.0"))
+        sampler = ParentBased(TraceIdRatioBased(sampler_ratio)) if sampler_ratio < 1.0 else None
+        provider = TracerProvider(
+            resource=resource,
+            **({} if sampler is None else {"sampler": sampler}),
+        )
+        if sampler is not None:
+            logger.info("OTEL head-based sampling active — ratio=%.4f", sampler_ratio)
 
         bsp_kwargs = dict(
             max_queue_size=int(
-                os.getenv("OTEL_BSP_MAX_QUEUE_SIZE", "2048")
+                os.getenv("OTEL_BSP_MAX_QUEUE_SIZE", "4096")
             ),
             schedule_delay_millis=int(
                 os.getenv("OTEL_BSP_SCHEDULE_DELAY_MILLIS", "5000")
             ),
             max_export_batch_size=int(
-                os.getenv("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "512")
+                os.getenv("OTEL_BSP_MAX_EXPORT_BATCH_SIZE", "1024")
             ),
             export_timeout_millis=int(
                 os.getenv("OTEL_BSP_EXPORT_TIMEOUT_MILLIS", "30000")
             ),
         )
 
-        endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4317")
+        # Gzip compression cuts LLM prompt/completion span sizes by 70-90 %, reducing
+        # both network transfer and otel-collector memory pressure.
+        # Endpoint is read from OTEL_EXPORTER_OTLP_ENDPOINT; the SDK appends /v1/traces.
         provider.add_span_processor(
             BatchSpanProcessor(
-                OTLPSpanExporter(endpoint=endpoint),
+                OTLPSpanExporter(compression=Compression.Gzip),
                 **bsp_kwargs,
             )
         )
@@ -146,7 +162,10 @@ def init_tracing(service_name: Optional[str] = None) -> None:
         # spans, then shutdown() stops the background export thread.
         atexit.register(_shutdown_on_exit)
 
-        logger.info("OTEL tracing initialised — collector: %s", endpoint)
+        logger.info(
+            "OTEL tracing initialised — collector: %s",
+            os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318"),
+        )
         _auto_instrument()
 
     except Exception as exc:

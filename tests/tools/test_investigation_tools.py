@@ -179,7 +179,7 @@ async def test_compute_passthrough():
         config=_config(),
     )
     assert "annual burn rate" in result.lower()
-    assert "$7.4M" in result
+    assert "7.4" in result  # model may format as "$7.4M", "$7.4 million", etc.
 
 
 # ---------------------------------------------------------------------------

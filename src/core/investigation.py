@@ -25,6 +25,7 @@ from src.config import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_SYNTHESIS_MODEL,
     INVESTIGATION_L4_COVERAGE_AUDIT,
+    INVESTIGATION_USE_RESPONSES_API,
     MAX_INVESTIGATION_ITERATIONS,
 )
 from src.core.evidence_model import InvestigationResult
@@ -33,10 +34,14 @@ from src.core.output_schemas import InvestigationActionsOutput
 from src.tools.investigation_tools import (
     compute,
     read_document,
+    search_bow,
     search_investment,
+    search_policy,
     search_portfolio,
+    search_science,
     search_web,
 )
+from src.tools.collection_tools import read_section
 from src.prompts.tool_prompts import (
     INVESTIGATION_SYSTEM,
     INVESTIGATION_TOOL_DESCRIPTIONS,
@@ -52,16 +57,30 @@ logger = logging.getLogger(__name__)
 
 _SUPPORTED_TOOLS = frozenset({
     "search_investment",
+    "search_portfolio",
     "search_bow",
+    "search_science",
+    "search_policy",
     "search_doc_type",
     "search_all",
     "search_web",
     "read_pages",
+    "read_document",
+    "read_section",
     "compute",
+    # submit_findings excluded — loop terminates via status field, not sentinel
 })
 
 
-_COLLECTION_TOOLS = frozenset({"search_investment", "search_bow", "search_doc_type", "search_all"})
+_COLLECTION_TOOLS = frozenset({
+    "search_investment",
+    "search_portfolio",
+    "search_bow",
+    "search_science",
+    "search_policy",
+    "search_doc_type",
+    "search_all",
+})
 
 
 async def _execute_actions(
@@ -86,8 +105,10 @@ async def _execute_actions(
 
     # Per-action enriched configs inject inv_id / bow_id so the @tool functions
     # apply the right filter without needing per-call function arguments.
-    _inv_config = {"configurable": {**base_configurable, "inv_id": inv_id, "bow_id": None}}
-    _bow_config = {"configurable": {**base_configurable, "inv_id": None, "bow_id": bow_id}}
+    # Top-level config keys (callbacks, run_id, metadata) are preserved so tool
+    # spans remain attached to the parent LangGraph trace in OTEL.
+    _inv_config = {**(config or {}), "configurable": {**base_configurable, "inv_id": inv_id, "bow_id": None}}
+    _bow_config = {**(config or {}), "configurable": {**base_configurable, "inv_id": None, "bow_id": bow_id}}
 
     async def _dispatch_one(action: dict) -> tuple[list[dict], int]:
         tool_name = action.get("tool", "")
@@ -104,9 +125,22 @@ async def _execute_actions(
                 text = await search_investment.ainvoke({"query": query}, config=_inv_config)
                 chunks.append({"text": text, "file_id": f"inv:{query[:60]}", "filename": "collection search", "collection": "investment", "doc_type": "investment"})
 
+            elif tool_name == "search_portfolio":
+                collection = action.get("collection") or None
+                text = await search_portfolio.ainvoke({"query": query, "collection": collection}, config=config)
+                chunks.append({"text": text, "file_id": f"portfolio:{query[:60]}", "filename": "portfolio search", "collection": collection or "all", "doc_type": "all"})
+
             elif tool_name == "search_bow" and bow_id:
-                text = await search_investment.ainvoke({"query": query}, config=_bow_config)
+                text = await search_bow.ainvoke({"query": query}, config=_bow_config)
                 chunks.append({"text": text, "file_id": f"bow:{query[:60]}", "filename": "BOW search", "collection": "investment", "doc_type": "investment"})
+
+            elif tool_name == "search_science":
+                text = await search_science.ainvoke({"query": query}, config=config)
+                chunks.append({"text": text, "file_id": f"science:{query[:60]}", "filename": "science search", "collection": "strategy", "doc_type": "science"})
+
+            elif tool_name == "search_policy":
+                text = await search_policy.ainvoke({"query": query}, config=config)
+                chunks.append({"text": text, "file_id": f"policy:{query[:60]}", "filename": "policy search", "collection": "strategy", "doc_type": "policy"})
 
             elif tool_name == "search_doc_type":
                 doc_type = action.get("doc_type") or None
@@ -122,14 +156,17 @@ async def _execute_actions(
 
             elif tool_name == "search_web":
                 text = await search_web.ainvoke(
-                    {"query": query, "rationale": f"evidence for: {query}"},
+                    {"query": query, "rationale": action.get("rationale") or f"evidence for: {query}"},
                     config=config,
                 )
-                chunks.append({"text": text, "file_id": f"web:{query[:40]}", "filename": "web search", "collection": "web", "doc_type": "web"})
-                web_count = 1
+                # F-056: stub text when Tavily absent must not count as evidence
+                if text and not text.startswith("[web search not configured"):
+                    chunks.append({"text": text, "file_id": f"web:{query[:40]}", "filename": "web search", "collection": "web", "doc_type": "web"})
+                    web_count = 1
 
-            elif tool_name == "read_pages":
+            elif tool_name in ("read_pages", "read_document"):
                 file_id = action.get("file_id", "")
+                section_id = action.get("section_id") or action.get("query") if tool_name == "read_document" and not action.get("file_id") else None
                 page_start = int(action.get("page_start", 1))
                 page_end = min(int(action.get("page_end", page_start + 10)), page_start + 20)
                 if file_id:
@@ -139,6 +176,17 @@ async def _execute_actions(
                     )
                     if text and len(text.strip()) > 50:
                         chunks.append({"text": text, "file_id": file_id, "filename": f"{file_id} pp{page_start}-{page_end}", "collection": "investment"})
+
+            elif tool_name == "read_section":
+                file_id = action.get("file_id", "")
+                section_id = action.get("section_id") or action.get("query", "")
+                if file_id and section_id:
+                    text = await read_section.ainvoke(
+                        {"file_id": file_id, "section_id": section_id},
+                        config=config,
+                    )
+                    if text and len(text.strip()) > 50:
+                        chunks.append({"text": text, "file_id": file_id, "filename": f"{file_id}§{section_id[:30]}", "collection": "investment"})
 
             elif tool_name == "compute" and facts:
                 text = await compute.ainvoke(
@@ -271,7 +319,9 @@ def _build_iteration_prompt(
         if new_chunks else "(no new evidence retrieved)"
     )
     l4_note = ""
-    if INVESTIGATION_L4_COVERAGE_AUDIT and iteration >= max_iterations - 2:
+    if INVESTIGATION_L4_COVERAGE_AUDIT:
+        # F-054: inject checklist on EVERY iteration (not just last 2) so the model
+        # is guided throughout, not just near the end of the loop.
         checklist = "\n".join(f"  {i+1}. {item}" for i, item in enumerate(L4_COVERAGE_AUDIT_ITEMS))
         l4_note = L4_COVERAGE_AUDIT_INSTRUCTION.format(checklist=checklist) + "\n\n"
     return (
@@ -290,6 +340,11 @@ def _build_iteration_prompt(
 
 def _build_system_prompt() -> str:
     return INVESTIGATION_SYSTEM.format(tool_descriptions=INVESTIGATION_TOOL_DESCRIPTIONS)
+
+
+def _is_openai_model(model: str) -> bool:
+    """Return True when model is an OpenAI Responses-API-compatible model."""
+    return model.startswith(("gpt-", "o1-", "o3-", "o4-"))
 
 
 def _validate_coverage_audit(output: InvestigationActionsOutput) -> bool:
@@ -311,46 +366,219 @@ def _validate_coverage_audit(output: InvestigationActionsOutput) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Main loop
+# Orphan 10 — Stateful OpenAI Responses API loop
 # ---------------------------------------------------------------------------
 
-_TERMINAL_STATUSES = frozenset({"answered", "not_answerable", "unresolved_conflict"})
-
-
-async def run_investigation(
+async def _run_openai_responses_loop(
     link_id: str,
     inv_id: str,
     bow_id: str,
     scope_id: str,
     claim: dict,
     model: str,
-    *,
-    config: Any = None,
-    max_iterations: int = MAX_INVESTIGATION_ITERATIONS,
-) -> InvestigationResult:
-    """Run a multi-turn tool-calling investigation of one causal link.
+    config: Any,
+    max_iterations: int,
+) -> "InvestigationResult":
+    """Stateful investigation loop via OpenAI Responses API with previous_response_id.
 
-    Dispatches tool actions asynchronously via asyncio.gather. Stops on:
-    - terminal status (answered / not_answerable / unresolved_conflict)
-    - empty next_actions
-    - CONSECUTIVE_EMPTY_THRESHOLD consecutive rounds with no new chunks
-    - max_iterations reached
+    Matches old investigation_loop._run_openai_loop(): each iteration continues
+    a persistent OpenAI Responses conversation thread instead of re-sending full
+    accumulated context. This reduces token cost and preserves reasoning continuity.
 
-    Returns InvestigationResult with all accumulated evidence and metadata.
+    Falls back to the stateless acall_structured path on any Responses API error.
     """
+    import asyncio as _asyncio
+    import json as _json
+
+    system_msg = _build_system_prompt()
+    t0 = time.time()
+    accumulated_chunks: list[dict] = []
+    tool_log: list[dict] = []
+    web_searches = 0
+    consecutive_empty = 0
+    prev_response_id: str | None = None
+
+    # Build INVESTIGATION_TOOLS in OpenAI function-call format
+    def _tool_schema(t: Any) -> dict:
+        schema = t.args_schema.model_json_schema() if hasattr(t, "args_schema") else {}
+        return {
+            "type": "function",
+            "name": t.name,
+            "description": (t.description or "")[:500],
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    k: v for k, v in schema.get("properties", {}).items()
+                    if k != "config"
+                },
+                "required": [r for r in schema.get("required", []) if r != "config"],
+                "additionalProperties": False,
+            },
+            "strict": False,
+        }
+
+    from src.tools.investigation_tools import INVESTIGATION_TOOLS
+    oai_tools = [_tool_schema(t) for t in INVESTIGATION_TOOLS]
+
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+    except Exception as exc:
+        logger.warning("Responses API unavailable (%s); falling back to stateless loop", exc)
+        return await _run_stateless_loop(
+            link_id, inv_id, bow_id, scope_id, claim, model, config, max_iterations
+        )
+
+    first_prompt = _build_first_prompt(claim, [])
+    initial_input = [
+        {"role": "user", "content": [{"type": "input_text", "text": first_prompt}]}
+    ]
+
+    def _create_response(input_data: Any, prev_id: str | None) -> Any:
+        kwargs: dict = dict(
+            model=model,
+            tools=oai_tools,
+            instructions=system_msg,
+        )
+        if prev_id:
+            kwargs["previous_response_id"] = prev_id
+            kwargs["input"] = input_data   # tool outputs for this turn
+        else:
+            kwargs["input"] = input_data   # initial user message
+        return client.responses.create(**kwargs)
+
+    final_output = InvestigationActionsOutput(
+        status="partially_answered", confidence="insufficient", answer="",
+    )
+
+    for iteration in range(max_iterations):
+        try:
+            if iteration == 0:
+                response = await _asyncio.to_thread(_create_response, initial_input, None)
+            else:
+                response = await _asyncio.to_thread(_create_response, tool_outputs_for_next, prev_response_id)
+            prev_response_id = response.id
+        except Exception as exc:
+            logger.warning("Responses API call failed at iteration %d: %s; switching to stateless", iteration, exc)
+            break
+
+        # Parse output items
+        actions: list[dict] = []
+        tool_calls: list[Any] = []
+        prose_parts: list[str] = []
+
+        for item in response.output:
+            if item.type == "message":
+                for block in item.content:
+                    if hasattr(block, "text"):
+                        prose_parts.append(block.text)
+            elif item.type == "function_call":
+                tool_calls.append(item)
+
+        prose = "\n".join(prose_parts)
+
+        # Try to extract structured output from prose
+        try:
+            import re as _re
+            m = _re.search(r'\{[^{}]*"status"[^{}]*\}', prose, _re.DOTALL)
+            if m:
+                parsed = _json.loads(m.group(0))
+                final_output = InvestigationActionsOutput(
+                    status=parsed.get("status", "partially_answered"),
+                    confidence=parsed.get("confidence", "low"),
+                    answer=parsed.get("answer", prose[:600]),
+                    evidence_refs=parsed.get("evidence_refs", []),
+                )
+        except Exception:
+            final_output = InvestigationActionsOutput(
+                status="partially_answered", confidence="low", answer=prose[:600],
+            )
+
+        # Convert function_calls to action dicts for _execute_actions
+        for tc in tool_calls:
+            try:
+                args = _json.loads(tc.arguments) if isinstance(tc.arguments, str) else tc.arguments
+                actions.append({"tool": tc.name, "query": args.get("query", ""), **args})
+            except Exception:
+                pass
+
+        tool_log.append({
+            "iteration": iteration,
+            "status": final_output.status,
+            "action_count": len(actions),
+            "response_id": prev_response_id,
+        })
+
+        # Terminal status check
+        if final_output.status in _TERMINAL_STATUSES:
+            if not _validate_coverage_audit(final_output):
+                actions = [{"tool": "search_investment",
+                            "query": "financial performance milestone delivery evidence quality"}]
+            else:
+                break
+
+        if not tool_calls and not actions:
+            break
+
+        # Execute tool actions
+        new_chunks, wc = await _execute_actions(actions, config, inv_id, bow_id, model)
+        web_searches += wc
+        new_chunks = _dedup_chunks(new_chunks, accumulated_chunks)
+
+        if not new_chunks:
+            consecutive_empty += 1
+            if consecutive_empty >= CONSECUTIVE_EMPTY_THRESHOLD:
+                break
+        else:
+            consecutive_empty = 0
+            accumulated_chunks.extend(new_chunks)
+
+        # Build tool outputs for next Responses API turn
+        tool_outputs_for_next = []
+        for tc in tool_calls:
+            # Find matching result text from executed actions
+            result_text = f"(executed {tc.name}: {len(new_chunks)} chunks)"
+            if new_chunks:
+                result_text = "\n".join(c.get("text", "")[:300] for c in new_chunks[:5])
+            tool_outputs_for_next.append({
+                "type": "function_call_output",
+                "call_id": getattr(tc, "call_id", tc.name),
+                "output": result_text,
+            })
+        if not tool_outputs_for_next:
+            break
+
+    # Fall back to stateless path if no valid result
+    if not final_output.answer and not accumulated_chunks:
+        return await _run_stateless_loop(
+            link_id, inv_id, bow_id, scope_id, claim, model, config, max_iterations
+        )
+
+    return _build_investigation_result(
+        link_id, inv_id, scope_id, final_output, accumulated_chunks, tool_log, web_searches, time.time() - t0, model
+    )
+
+
+async def _run_stateless_loop(
+    link_id: str,
+    inv_id: str,
+    bow_id: str,
+    scope_id: str,
+    claim: dict,
+    model: str,
+    config: Any,
+    max_iterations: int,
+) -> "InvestigationResult":
+    """Stateless acall_structured investigation loop (non-OpenAI models or fallback)."""
     t0 = time.time()
     system_msg = _build_system_prompt()
-
     accumulated_chunks: list[dict] = []
     tool_log: list[dict] = []
     web_searches = 0
     consecutive_empty = 0
     final_output = InvestigationActionsOutput(
-        status="partially_answered",
-        confidence="insufficient",
-        answer="",
+        status="partially_answered", confidence="insufficient", answer="",
     )
-
     prompt = _build_first_prompt(claim, accumulated_chunks)
 
     for iteration in range(max_iterations):
@@ -376,24 +604,18 @@ async def run_investigation(
             "action_count": len(actions),
         })
 
-        # L4 gate: if coverage audit enabled and final, validate before accepting answer
         if output.status in _TERMINAL_STATUSES:
             if not _validate_coverage_audit(output):
                 logger.debug("L4 coverage audit failed at iteration %d, continuing", iteration)
-                # Force one more iteration to address gaps
-                actions = [{
-                    "tool": "search_investment",
-                    "query": "financial performance milestone delivery partnership evidence quality",
-                }]
+                actions = [{"tool": "search_investment",
+                            "query": "financial performance milestone delivery partnership evidence quality"}]
             else:
                 break
 
         if not actions:
             break
 
-        new_chunks, wc = await _execute_actions(
-            actions, config, inv_id, bow_id, model
-        )
+        new_chunks, wc = await _execute_actions(actions, config, inv_id, bow_id, model)
         web_searches += wc
         new_chunks = _dedup_chunks(new_chunks, accumulated_chunks)
 
@@ -402,8 +624,7 @@ async def run_investigation(
             if consecutive_empty >= CONSECUTIVE_EMPTY_THRESHOLD:
                 logger.debug(
                     "run_investigation: %d consecutive empty rounds for %s, stopping",
-                    consecutive_empty,
-                    link_id,
+                    consecutive_empty, link_id,
                 )
                 break
         else:
@@ -414,13 +635,23 @@ async def run_investigation(
             claim, new_chunks, accumulated_chunks, output, iteration + 1, max_iterations
         )
 
-    elapsed = time.time() - t0
+    return _build_investigation_result(
+        link_id, inv_id, scope_id, final_output, accumulated_chunks, tool_log, web_searches, time.time() - t0, model
+    )
 
-    # Build annotated excerpts; dedup by 80-char prefix.
-    # Each dict carries both the new pipeline fields (text, source, credibility_tier,
-    # link_id) AND the old-schema fields expected by downstream consumers
-    # (excerpt_id, quote, source_file, source_type, type, context_needed) so
-    # deliver.py can write a CSV that matches the legacy 13-column format.
+
+def _build_investigation_result(
+    link_id: str,
+    inv_id: str,
+    scope_id: str,
+    final_output: "InvestigationActionsOutput",
+    accumulated_chunks: list[dict],
+    tool_log: list[dict],
+    web_searches: int,
+    elapsed: float,
+    model: str,
+) -> "InvestigationResult":
+    """Build InvestigationResult from accumulated loop state."""
     import re as _re_inv
 
     _CREDIBILITY_TIER = {
@@ -435,27 +666,32 @@ async def run_investigation(
     _answered = final_output.status == "answered"
     seen_prefixes: set[str] = set()
     annotated_excerpts: list[dict] = []
+    ref_counter = 0
     for i, c in enumerate(accumulated_chunks):
         text = c.get("text", "")
         prefix = text[:80]
         if prefix in seen_prefixes:
             continue
         seen_prefixes.add(prefix)
+        ref_counter += 1
+        ref_id = f"§{ref_counter:04d}"
         doc_type = c.get("doc_type", "")
         source = c.get("filename", c.get("file_id", ""))
         credibility_tier = _CREDIBILITY_TIER.get(doc_type, "tier2_secondary")
         numerical_facts = _re_inv.findall(r'\$[\d,]+(?:\.\d+)?(?:\s*[MBK])?|\d+(?:\.\d+)?%', text)
         safe_link = link_id[:20].replace(" ", "_") if link_id else "lnk"
         annotated_excerpts.append({
-            # ── new pipeline fields ──────────────────────────────────────────
+            "ref_id": ref_id,
             "text": text[:500],
             "source": source,
             "credibility_tier": credibility_tier,
             "inv_id": inv_id,
             "scope_id": scope_id,
             "link_id": link_id,
-            # ── old-schema fields (CSV compat with legacy 13-column format) ──
-            "excerpt_id": f"EX-{inv_id}-{safe_link}-{i:03d}",
+            "file_id": c.get("file_id", ""),
+            "page_start": c.get("page_start", 0),
+            "page_end": c.get("page_end", 0),
+            "excerpt_id": f"EX-{inv_id}-{safe_link}-{ref_counter:03d}",
             "source_file": source,
             "page": c.get("page_start", 0),
             "source_type": c.get("collection", doc_type),
@@ -491,4 +727,71 @@ async def run_investigation(
         elapsed_seconds=elapsed,
         model=model,
         terminal_status=final_output.status,
+        # Routing fields for collect_link_assessments — without these, to_dict()
+        # produces no scope_id and every assessment is silently dropped.
+        scope_id=scope_id,
+        link_id=link_id,
+        inv_id=inv_id,
     )
+
+
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+_TERMINAL_STATUSES = frozenset({"answered", "not_answerable", "unresolved_conflict"})
+
+
+async def run_investigation(
+    link_id: str,
+    inv_id: str,
+    bow_id: str,
+    scope_id: str,
+    claim: dict,
+    model: str,
+    *,
+    config: Any = None,
+    max_iterations: int = MAX_INVESTIGATION_ITERATIONS,
+) -> InvestigationResult:
+    """Run a multi-turn tool-calling investigation of one causal link.
+
+    Routes to the stateful OpenAI Responses API path (Orphan 10) when
+    INVESTIGATION_USE_RESPONSES_API=true and the model is an OpenAI model;
+    otherwise uses the stateless acall_structured path.
+
+    Both paths stop on:
+    - terminal status (answered / not_answerable / unresolved_conflict)
+    - empty next_actions
+    - CONSECUTIVE_EMPTY_THRESHOLD consecutive rounds with no new chunks
+    - max_iterations reached
+    """
+    if INVESTIGATION_USE_RESPONSES_API and _is_openai_model(model):
+        return await _run_openai_responses_loop(
+            link_id, inv_id, bow_id, scope_id, claim, model, config, max_iterations
+        )
+    return await _run_stateless_loop(
+        link_id, inv_id, bow_id, scope_id, claim, model, config, max_iterations
+    )
+
+
+async def _run_investigation_body(  # kept for backward compat references
+    link_id: str,
+    inv_id: str,
+    bow_id: str,
+    scope_id: str,
+    claim: dict,
+    model: str,
+    *,
+    config: Any = None,
+    max_iterations: int = MAX_INVESTIGATION_ITERATIONS,
+) -> InvestigationResult:
+    return await run_investigation(
+        link_id, inv_id, bow_id, scope_id, claim, model,
+        config=config, max_iterations=max_iterations,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Old loop body (preserved below, now split into _run_stateless_loop + helpers)
+# ---------------------------------------------------------------------------
+

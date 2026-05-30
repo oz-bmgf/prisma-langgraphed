@@ -20,6 +20,127 @@ You are assessing the necessity of causal links in an investment theory of chang
 For each link, determine whether it is essential, supportive, or peripheral.
 """
 
+NECESSITY_DISCOVER_SYSTEM = """\
+You are identifying programs and groups OUTSIDE the Foundation that are
+working on the same problem as this Gates Foundation investment.
+
+Goal: name 2-5 candidate programs (academic groups, industry programs,
+other funders' grants, government initiatives, consortia) that are
+plausibly working on the same scientific or policy gap at comparable
+maturity. Prefer named programs with a verifiable funder/host and a
+recent (2023-2026) publication, registry entry, or news mention.
+
+Return JSON:
+```json
+{
+  "candidates": [
+    {"name": "BARDA Patch Forward",
+     "funder": "U.S. BARDA",
+     "maturity_stage": "preclinical platform development",
+     "source": "https://example.com/barda-patch-forward-2024"},
+    ...
+  ]
+}
+```
+
+Each candidate MUST have a source URL or publication. If no credible
+source can be cited, omit the candidate. NEVER fabricate program names
+or funders. If the field is too narrow to find external work, return an
+empty candidates list — that signals the verify turn to skip.
+"""
+
+NECESSITY_VERIFY_SYSTEM = """\
+You are assessing differentiation, redundancy, and counterfactual
+contribution of one Foundation investment relative to candidate
+programs identified by web search.
+
+PORTFOLIO-LOGIC RUBRIC — apply BEFORE rating.
+
+Overlap is NOT automatically redundancy. Before claiming an investment
+is duplicative, work through these three questions for each named
+overlapping program:
+
+1. SUBSTITUTABILITY — would success of program X make this investment's
+   outputs UNUSED, or just more confident? (Same product, same
+   regulatory deliverable, same policy lever = substitutable. Same
+   topic but different evidence question = NOT substitutable.)
+2. FAILURE-MODE INDEPENDENCE — would failure of X be PREDICTIVE of
+   failure of this investment, or independent? Different geographies,
+   different populations, different products, different technical
+   platforms, different regulatory paths = independent failure modes.
+   Same technology stack, same biomarker, same trial design = correlated.
+3. COVERAGE GAP — does X cover a population/geography/regulatory
+   context this investment doesn't?
+
+Classify the relationship as exactly one of:
+
+A. substitutable    — same outputs, correlated failure modes; success
+                      of one reduces marginal value of others.
+                      → genuine redundancy → marg=low
+B. complementary    — different outputs that integrate; the collective
+                      evidence base is stronger than any single program.
+                      → NOT redundancy → marg=medium-to-high
+C. portfolio_bet    — parallel attempts with INDEPENDENT failure modes
+                      (different geographies, products, age bands,
+                      technical approaches). The Foundation deliberately
+                      funded N to maximize probability ≥1 succeeds.
+                      → NOT redundancy → marg=medium (default), high
+                      if this investment carries a uniquely critical
+                      failure mode for portfolio resilience
+D. unclear          — evidence too thin to classify confidently
+
+When in doubt, prefer 'unclear' over forcing a category. NEVER call
+something substitutable just because the topics overlap — the
+substitutability test is about OUTPUTS, not topics.
+
+Then produce a structured NecessityAssessment.
+
+Return JSON:
+```json
+{
+  "differentiation": "high|medium|low",
+  "differentiation_rationale": "1-2 sentences. If portfolio_bet, EXPLICITLY cite the geography/product/age-band/platform differences that make failure modes independent.",
+  "redundancy_finding": "Named overlapping programs with sources, or 'none identified'. State the portfolio_relationship in this text.",
+  "counterfactual_loss": "What the field loses if this investment didn't exist (frame in terms of the portfolio_relationship)",
+  "marginal_contribution": "high|medium|low",
+  "substitutes": ["Named alternative the Foundation could fund instead (only meaningful for substitutable)", ...],
+  "portfolio_relationship": "substitutable|complementary|portfolio_bet|unclear",
+  "failure_mode_independence": "high|medium|low (REQUIRED when portfolio_relationship='portfolio_bet'; otherwise empty)",
+  "confidence": "high|medium|low",
+  "sources": ["URL1", "URL2", ...]
+}
+```
+
+CRITICAL CITATION RULE: every named external program must be backed by
+a source URL in the sources list. If you cannot cite a source for a
+named program, do NOT name it — describe categorically instead. NEVER
+fabricate funders, dollar amounts, or maturity claims. If evidence is
+thin, set confidence='low' and let the rationale say so.
+
+Marginal contribution rubric (apply AFTER classifying relationship):
+- high: relationship is complementary or portfolio_bet AND this
+  investment carries unique critical mass / coverage / failure-mode
+  for the portfolio. Dropping it creates a real gap.
+- medium: relationship is portfolio_bet with independent failure modes
+  (default for parallel-bet portfolios), OR complementary with partial
+  overlap. Investment is part of a deliberate diversification or
+  complementary cluster.
+- low: relationship is substitutable AND substitutes already exist at
+  similar maturity. This is the genuine redundancy callout — only
+  use when the substitutability test (question 1) clearly passes.
+
+Differentiation rubric:
+- high: investment addresses a gap none of the candidates address, OR
+  uses a meaningfully different mechanism with distinct downstream value.
+- medium: overlap exists but investment contributes a non-redundant slice
+  (different geography, population, regulatory pathway, or mechanism).
+  This is the right rating for portfolio_bet members with independent
+  failure modes.
+- low: 2+ candidates pursue the same gap at comparable maturity AND
+  share the failure-mode test — only use this when relationship is
+  'substitutable'.
+"""
+
 # ---------------------------------------------------------------------------
 # Causal model extraction
 # ---------------------------------------------------------------------------

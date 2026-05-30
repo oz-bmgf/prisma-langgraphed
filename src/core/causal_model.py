@@ -15,6 +15,7 @@ import math
 from typing import Any
 
 from src.config import (
+    CAUSAL_MAX_TOKENS,
     DEFAULT_MAX_TOKENS,
     DEFAULT_SYNTHESIS_MODEL,
 )
@@ -43,15 +44,18 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _RISK_MATRIX: dict[tuple[str, str], tuple[str, int]] = {
-    ("terminal", "high"): ("critical", 1),
+    # Copied verbatim from old-repo causal_model.py — do not modify sort keys
+    # without also updating the equivalent in prisma-ai-review.
+    # sort_key: 1 = most critical, 9 = negligible
+    ("terminal", "high"):     ("critical", 1),
     ("terminal", "moderate"): ("critical", 2),
-    ("major", "high"): ("high", 3),
-    ("major", "moderate"): ("high", 4),
-    ("minor", "high"): ("medium", 5),
-    ("terminal", "low"): ("medium", 6),
-    ("major", "low"): ("low", 7),
-    ("minor", "moderate"): ("low", 8),
-    ("minor", "low"): ("negligible", 9),
+    ("major",    "high"):     ("high",     3),
+    ("terminal", "low"):      ("high",     4),  # well-understood terminal risk stays HIGH
+    ("major",    "moderate"): ("medium",   5),  # was wrongly ("high", 4) in new repo
+    ("minor",    "high"):     ("medium",   6),  # was wrongly ("medium", 5) in new repo
+    ("major",    "low"):      ("low",      7),
+    ("minor",    "moderate"): ("low",      8),
+    ("minor",    "low"):      ("low",      9),  # label was wrongly "negligible" in new repo
 }
 
 # Keywords that flag an assumption as science-heavy (add web-search suggestions).
@@ -120,7 +124,7 @@ async def extract_causal_model(
             system_msg=CAUSAL_EXTRACTION_SYSTEM,
             model=model,
             schema=CausalModelExtraction,
-            max_tokens=DEFAULT_MAX_TOKENS,
+            max_tokens=CAUSAL_MAX_TOKENS,  # 32000 — matches OLD; large ToC chains need room
         )
         links = [
             CausalLink(
@@ -303,6 +307,34 @@ async def forecast_consequences(
     return cm
 
 
+def _make_search_suggestions(assumption: ScoredAssumption) -> list[str]:
+    """Generate targeted search queries for this assumption.
+
+    Mirrors old-repo causal_model._make_search_suggestions. Science-heavy
+    assumptions get ASTA/web queries; financial assumptions get investment queries.
+    """
+    text = assumption.assumption.lower()
+    question = assumption.investigation_question or assumption.assumption
+    suggestions: list[str] = []
+
+    if any(kw in text for kw in _SCIENCE_KEYWORDS):
+        suggestions.append(f"search_asta: {question}")
+        suggestions.append(f"search_web: peer-reviewed evidence on {question}")
+    if any(kw in text for kw in ("financial", "budget", "disbursement", "funding", "runway")):
+        suggestions.append(f"search_investment: budget actuals disbursement {question}")
+    if any(kw in text for kw in ("partner", "grantee", "capacity", "delivery", "milestone")):
+        suggestions.append(f"search_investment: {question}")
+    if any(kw in text for kw in ("policy", "regulation", "government", "ministry")):
+        suggestions.append(f"search_policy: {question}")
+        suggestions.append(f"search_web: {question}")
+
+    if not suggestions:
+        # Generic fallback — always produce at least one suggestion
+        suggestions.append(f"search_investment: {question}")
+
+    return suggestions[:4]
+
+
 def make_investigation_claims(
     cm: CausalModel,
     bow_id: str,
@@ -310,16 +342,26 @@ def make_investigation_claims(
 ) -> list[dict]:
     """Build investigation task dicts from the ranked assumption list.
 
-    Each dict is suitable for use as a Send payload in the LangGraph fan-out.
+    Each dict is a Send payload for the LangGraph fan-out.
+    Fields added to match old-repo InvestigationClaim:
+      priority         — terminal→critical, major→important, else→exploratory
+      suggested_searches — targeted queries from _make_search_suggestions()
     task_id format: "{inv_id}-assumption-{i+1:03d}"
-    Science assumptions (containing _SCIENCE_KEYWORDS) get a web_search_hint.
     """
     claims: list[dict] = []
     inv_id = inv_id or cm.inv_id
 
+    _PRIORITY_MAP = {
+        "terminal": "critical",
+        "major":    "important",
+    }
+
     for i, assumption in enumerate(cm.assumptions):
         text_lower = assumption.assumption.lower()
         is_science = any(kw in text_lower for kw in _SCIENCE_KEYWORDS)
+
+        priority = _PRIORITY_MAP.get(assumption.consequence, "exploratory")
+        suggested_searches = _make_search_suggestions(assumption)
 
         claim: dict = {
             "task_id": f"{inv_id}-assumption-{i+1:03d}",
@@ -332,6 +374,8 @@ def make_investigation_claims(
             "if_wrong": assumption.if_wrong,
             "investigation_question": assumption.investigation_question,
             "risk_rank": assumption.risk_rank,
+            "priority": priority,
+            "suggested_searches": suggested_searches,
         }
         if is_science:
             claim["web_search_hint"] = (

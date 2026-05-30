@@ -32,16 +32,40 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
+# F-048: source-credibility annotation map — matches OLD investigation_loop._SOURCE_TYPE_MAP
+_SOURCE_CREDIBILITY: dict[str, str] = {
+    "progress_report": "GRANTEE SELF-REPORT",
+    "financial_report": "GRANTEE SELF-REPORT",
+    "budget": "GRANTEE SELF-REPORT",
+    "proposal": "GRANTEE SELF-REPORT",
+    "milestone": "GRANTEE SELF-REPORT",
+    "amendment": "GRANTEE SELF-REPORT",
+    "due_diligence": "FOUNDATION INTERNAL",
+    "strategy": "FOUNDATION INTERNAL",
+    "strategy_review": "FOUNDATION INTERNAL",
+    "dac_review": "FOUNDATION INTERNAL",
+    "portfolio_review": "FOUNDATION INTERNAL",
+    "meeting": "FOUNDATION INTERNAL",
+    "science": "EXTERNAL/INDEPENDENT",
+    "external": "EXTERNAL/INDEPENDENT",
+    "policy": "EXPERT CONSENSUS",
+    "regulatory": "EXPERT CONSENSUS",
+    "tpp": "EXPERT CONSENSUS",
+}
+
+
 def _fmt_results(results: list[SearchResult]) -> str:
     if not results:
         return "(no results)"
     lines = []
     for i, r in enumerate(results, 1):
         snippet = r.text.replace("\n", " ")[:400]
+        credibility = _SOURCE_CREDIBILITY.get(r.doc_type or "", "")
+        cred_str = f" [{credibility}]" if credibility else ""
         lines.append(
             f"[{i}] score={r.score:.3f} file={r.file_id[:60]} "
             f"inv={r.inv_id or '-'} bow={r.bow_id or '-'} "
-            f"pages={r.page_start}–{r.page_end} doc_type={r.doc_type or '-'}\n"
+            f"pages={r.page_start}–{r.page_end} doc_type={r.doc_type or '-'}{cred_str}\n"
             f"    {snippet}"
         )
     return "\n\n".join(lines)

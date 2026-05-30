@@ -406,6 +406,11 @@ class InvestigationResult:
     elapsed_seconds: float = 0.0
     model: str = ""
     terminal_status: str = ""
+    # Routing fields — required by collect_link_assessments to merge results into the
+    # correct scope's link_assessments list. Matches ScienceInvestigationResult pattern.
+    scope_id: str = ""
+    link_id: str = ""
+    inv_id: str = ""
 
     def to_dict(self) -> dict:
         import dataclasses

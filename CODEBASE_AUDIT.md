@@ -30,11 +30,12 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | Unified CLI entry point for the NQPR pipeline. Registers 8 subcommands, loads `.env`, initialises Phoenix/OTEL tracing, delegates to handler functions. |
+| **What it does** | Unified CLI entry point for the NQPR pipeline. Registers 8 named subcommand parsers (`collect`, `analyze`, `precheck`, `prepare-research`, `research`, `investigate`, `finalize`, `evidence-audit`), loads `.env`, initialises Phoenix/OTEL tracing, delegates to handler functions. |
 | **Inputs** | `argv` (CLI args). Each subcommand accepts typed flags (see §14). |
-| **Outputs** | Calls handler functions; no direct file writes except via delegated modules. |
+| **Outputs** | Delegates to handler functions. `_cmd_analyze` additionally: sets `LLM_TRACE_FILE` env var (→ `output_dir/trace.jsonl`), calls `build_asset_registry` + `write_run_assets` when `--aux-collections` provided (writes `output_dir/assets.json`), writes `output_dir/run_meta.json`, conditionally writes `output_dir/draft_report.md` (pre-verifier copy when scoring file present) and `output_dir/final_report.pdf` (when pandoc/weasyprint available). |
 | **External deps** | `dotenv`, `src.tracing.bootstrap.init_tracing` (optional); `argparse`, `logging` (stdlib). |
 | **How invoked** | `python -m src.qpr <subcommand>` or `nqpr <subcommand>`. |
+| **`_cmd_analyze` call site** | Calls `run_research_analyst(tools, call_llm, research_model=args.research_model, synthesis_model=args.model, focus=args.focus, focus_bows=args.focus_bows, cache_dir=output_dir/"threads")` — **`orientation_model` is NOT passed** (the parameter exists in `run_research_analyst` but the CLI never exposes or forwards it; it defaults to `ANALYSIS_MODEL` inside `run_research_analyst`). |
 | **State between calls** | None. |
 
 ### `__main__.py`
@@ -86,9 +87,11 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 | Field | Detail |
 |---|---|
 | **What it does** | Loads a fully prepared collection from disk (embedding index, doc catalog, scoring, BOW hierarchy, intelligence) into a ready-to-query `CollectionTools` + `CollectionContext` pair. |
-| **Inputs** | `load_collection(collection_name, base_dir, *, aux_collections) → (CollectionTools, CollectionContext)` |
+| **Inputs** | `load_collection(collection_name: str, base_dir: Path \| None = None, *, aux_collections: list[str] \| None = None) → tuple[CollectionTools, CollectionContext]` |
 | **Outputs** | Returns `(CollectionTools, CollectionContext)`; no files written (read-only). |
-| **External deps** | `numpy`, `sqlite3`, `sklearn`; env vars `NQPR_SEARCH_BACKEND`, `QDRANT_*`, `AZURE_SEARCH_*`. |
+| **Files read** | `document_catalog.json` (falls back to `doc_list.json`), `investment_scoring.json`, `bow_investment_map.json`, `investment_bow_rows.json`, `investment_intelligence.json`, `embedding_index/chunks.json`, `embedding_index/vectors.npy`, `embedding_index/chunks.sqlite`. Pages dir resolved via `_resolve_pages_dir`: checks `pages/` then `etl/`. |
+| **Backend selection** | Reads `NQPR_SEARCH_BACKEND` env var (`"local"` default \| `"qdrant"` \| `"azure"`). Qdrant-specific: `QDRANT_COLLECTION_NAME`, `QDRANT_PORT`, `QDRANT_HOST`, `QDRANT_URL`, `QDRANT_API_KEY`, `QDRANT_EMBEDDING_MODEL` (default `"text-embedding-3-small"`). Azure-specific: `AZURE_SEARCH_INDEX` (default `"edp-idm-index"`), `AZURE_SEARCH_TEAM`. |
+| **Aux-collection routing** | For each name in `aux_collections`, tries `LocalSearchIndex.load({base_dir}/{aux}-ingested/embedding_index/)` first, then falls back to `AzureSearchIndex(team=aux, strict=False)`. Builds `AssetRegistry` via `build_asset_registry`. |
 | **How invoked** | Imported and called before any analysis (from `_cmd_analyze`, `_cmd_investigate`, etc.). |
 | **State between calls** | None (returns fresh objects each call). |
 
@@ -107,12 +110,12 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | Unified tool API for NQPR agents — exposes BOW navigation, document reading, section lookup, semantic/hybrid search, scoring retrieval, and image access. |
-| **Inputs** | Constructor: `CollectionTools(ctx: CollectionContext)`. Methods: `search(query, *, top_k, bow_filter, inv_filter)`, `read_section(file_id, section_id)`, `read_pages(file_id, pages)`, `get_scoring(inv_id)`, etc. |
+| **What it does** | Unified tool API for NQPR agents — exposes BOW navigation, document reading, section lookup, scoring retrieval, and image access. **Does NOT expose a `search()` method** — search goes through `tools._embedding_index.search_with_filter()` or `tools._embedding_index.hybrid_search()` directly. |
+| **Inputs** | Constructor: `CollectionTools(ctx: CollectionContext)`. Public methods: `list_bows()`, `list_files()`, `get_bow_summary(bow_id)`, `get_investment_summary(inv_id)`, `get_document_toc(file_id)`, `get_document_summary(file_id)`, `read_section(file_id, section_id)`, `read_pages(file_id, pages)`, `get_scoring(inv_id)`, `rerank(chunks, query, top_k)`, `page_has_visual(file_id, page_num)`, `read_page_image(file_id, page_num)`. |
 | **Outputs** | Methods return dicts, lists, strings, or base64 image bytes. No files written. |
 | **External deps** | `openai` (dense search fallback), `sklearn`, `numpy`. |
 | **How invoked** | Instantiated by `load_collection`; methods called by agent investigation loops. |
-| **State between calls** | Instance: `_strategy_chunks`, `_doc_index`, `_chunk_embeddings`, `_openai_client`, `_lock`, `_embedding_index`, `_aux_indexes`, three lookup dicts — all cached on the instance. |
+| **State between calls** | Instance (lazy-loaded): `self.ctx`, `_strategy_chunks: list[dict] \| None`, `_strategy_papers: list[dict] \| None`, `_doc_index: dict[str, DocumentIndex]`, `_investment_docs_by_name: dict[tuple[str,str], list[DocumentIndex]]`, `_investment_docs_by_path: dict[tuple[str,str], DocumentIndex]`, `_investment_docs_by_legacy_id: dict[str, list[DocumentIndex]]`, `_lock: threading.Lock`, `_chunk_embeddings: Any`, `_openai_client: Any`, `_embedding_index` (= `ctx.embedding_index`), `_aux_indexes: dict[str, Any]`, `_asset_registry` (property on `ctx`). |
 
 ### `program_config.py`
 
@@ -287,9 +290,10 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | Top-level V4 pipeline orchestrator running 6 sequential phases: orientation → scope/thread design → timelines + narratives → causal pipeline (per-thread parallel) → cross-cutting analysis → quality assessment + report assembly. |
-| **Inputs** | `run_research_analyst(tools, call_llm, *, orientation_model, research_model, synthesis_model, focus, focus_bows, cache_dir) → AnalystReport` |
-| **Outputs** | Returns `AnalystReport`. Writes: `cache_dir/final_report.md`, `analyst_report.json`, `scope_outputs.json`, `numerical_provenance.json`, `verification_sources.json`, `excerpts.csv`, `allocation_verification.json`, `numerical_verification.json`. |
+| **What it does** | Top-level V4 pipeline orchestrator. Runs 8+ numbered sub-phases: Phase 1 (orientation) → Phase 2 (scope computation, pure deterministic) → Phase 2.5 (timeline construction, no LLM) → Phase 2.6 (timeline narratives, LLM, parallel per scope) → Phase 3 (causal pipeline via `run_causal_pipeline`) → Phase 3.8 (decision projection via `run_phase38`, called here not inside causal pipeline) → Phase 5 (cross-cutting analysis, internally named `_phase4_crosscut`) → Phase 6 (quality assessment + report assembly). Cross-cutting phase pre-computes `portfolio_metrics` via `code_interpreter` using `synthesis_model`. |
+| **Inputs** | `run_research_analyst(tools, call_llm, *, orientation_model: str = ANALYSIS_MODEL, research_model: str = ANALYSIS_MODEL, synthesis_model: str = SYNTHESIS_MODEL, focus: str \| None = None, focus_bows: list[str] \| None = None, cache_dir: Path \| None = None) → AnalystReport`. CLI passes only `research_model`, `synthesis_model`, `focus`, `focus_bows`, `cache_dir` — `orientation_model` always uses its default. |
+| **Model routing** | Phase 1 orientation: `orientation_model` (default `ANALYSIS_MODEL = "gpt-5.5"`). Phase 2.6 narratives, Phase 3 causal, Phase 3.8 decisions: `research_model`. Phase 5 cross-cutting, Phase 6 assembly: `synthesis_model` (default `SYNTHESIS_MODEL = "claude-opus-4-7"`). |
+| **Outputs** | Returns `AnalystReport`. Writes incrementally to `cache_dir` (= `output_dir/threads/`): `final_report.md`, `analyst_report.json` (written after each phase), `scope_outputs.json`, `numerical_provenance.json`, `verification_sources.json`, `allocation_verification.json`, `numerical_verification.json`, `allocation_issues.md`, `scope_set.json`, `checkpoint_initial.json`, `checkpoint_after_phase3_threads.json`, `checkpoint_after_phase5_crosscut.json`, `checkpoint_after_phase6_quality.json`, `checkpoint_final.json`. Also writes `{ingested_dir}/timeline_narratives.json` (Phase 2.6 narrative cache). `excerpts.csv` is written to `cache_dir.parent` (i.e. `output_dir/`), not inside `threads/`. |
 | **External deps** | All sub-modules below; no direct API calls. |
 | **How invoked** | `python -m src.qpr analyze --collection <C>` → `_cmd_analyze` → `run_research_analyst(...)`. |
 | **State between calls** | None; all state in returned `AnalystReport` and files in `cache_dir`. |
@@ -298,12 +302,12 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | Core Phase 3 orchestrator — 8 sub-stages (3.1–3.8): causal model extraction → consequence forecasts → BOW context → per-link tool-calling investigation (parallel) → synthesis → critique → gap analysis → science validation → necessity check → decision projection. |
-| **Inputs** | `run_causal_pipeline(scopes, scope_timelines, tools, call_llm, context, cache_dir, research_model, synthesis_model) → list[ScopeOutput]` |
+| **What it does** | Core Phase 3 orchestrator — 12+ sub-stages: 3.1 (extract causal model per investment, parallel) → 3.1a (BOW-level causal model extraction) → 3.1b (map/frame investment links) → 3.2 (consequence forecast per investment, parallel) → 3.3 (BOW context per scope, parallel, independent) → 3.4 (per-link investigation, parallel) → 3.4b (orphan BOW link investigation) → 3.5 (investment synthesis, parallel) → 3.5b (critique rounds) → 3.5c (gap investigation) → 3.5d (science validation, parallel) → 3.7 (necessity check per investment) → 3.6 (BOW synthesis per scope — runs last despite lower number). **Phase 3.8 (decision projection) is NOT part of this function** — it is called separately from `run_research_analyst`. |
+| **Inputs** | `run_causal_pipeline(scopes: list[dict], scope_timelines: dict[str, ScopeTimeline], tools: Any, call_llm: Any, context: Any, cache_dir: Path \| None = None, *, research_model: str = ANALYSIS_MODEL, synthesis_model: str = SYNTHESIS_MODEL) → list[ScopeOutput]` |
 | **Outputs** | Returns `list[ScopeOutput]`; writes per-scope JSON checkpoints to `cache_dir`. |
-| **External deps** | `causal_model`, `rubric_evaluator`, `investigation_loop`, `claim_investigator`, `science_investigator`, `decision_projection`. |
+| **External deps** | `causal_model`, `rubric_evaluator`, `investigation_loop`, `claim_investigator`, `science_investigator`. (`decision_projection` is NOT imported here — phase 3.8 is invoked by the caller.) |
 | **How invoked** | Called from `research_analyst_agent._phase4_causal()`. |
-| **State between calls** | Constants: `_MAX_LINK_WORKERS=16`, `_MAX_INVESTIGATION_ITERATIONS=40` (module-level). |
+| **State between calls** | Constants: `_MAX_LINK_WORKERS=16`, `_MAX_INVESTIGATION_ITERATIONS=40`, `_MAX_LINK_ITERATIONS=40` (module-level). |
 
 ### `causal_model.py`
 
@@ -320,10 +324,15 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | Provider-neutral tool-calling investigation loop (OpenAI GPT-5.x and Anthropic); the LLM autonomously calls 9 tools to investigate a hypothesis; controlled by three env-var levers (reasoning effort, coverage audit, auditor). |
-| **Inputs** | `run_investigation(claim, tools, call_llm, inv_id, bow_id, *, model, max_iterations) → InvestigationResult`; tool set: `search_investment`, `search_portfolio`, `search_web`, `read_document`, `compute`, `submit_findings`, `list_documents`, `read_document_summary`, `get_document_structure`, `read_section` |
+| **What it does** | Provider-neutral tool-calling investigation loop (OpenAI GPT-5.x via Responses API, Anthropic via Messages API); the LLM autonomously calls **10 tools** to investigate a hypothesis; controlled by three env-var levers (reasoning effort, coverage audit, auditor). |
+| **Inputs** | `run_investigation(system_prompt: str, initial_context: str, tools: Any, *, inv_id: str \| None = None, bow_id: str \| None = None, model: str \| None = None, tool_defs: list[dict] \| None = None, max_iterations: int = 20, trace_context: dict \| None = None) → InvestigationResult`. Does NOT accept a `claim` object or `call_llm` — takes pre-rendered prompt strings and calls SDK clients directly. |
+| **Tool set (10)** | `search_investment`, `search_portfolio`, `search_web`, `read_document`, `compute`, `submit_findings`, `list_documents`, `read_document_summary`, `get_document_structure`, `read_section`. |
+| **OpenAI path** | Uses `client.responses.create` with `previous_response_id` for stateful conversation continuity (Responses API, not chat completions). |
+| **Anthropic path** | Uses `thinking={"type": "adaptive"}`, `max_tokens=16000` per call. |
+| **Auditor lever** | Every 3 iterations, calls `FAST_MODEL` with `max_tokens=400`; system msg: `"You are a meticulous research auditor. Your only job is to list what's missing before a confident verdict can be made. Be specific and brief — 3-5 bullet points max. Reply 'COMPLETE' (alone) if coverage is genuinely sufficient."` |
+| **`compute` tool** | Calls `FAST_MODEL` with system `"You are a numerical analyst. Compute precisely and show your work."`, `max_tokens=16000`. |
 | **Outputs** | Returns `InvestigationResult` dataclass; no files written. |
-| **External deps** | `openai` (Responses API), `anthropic` (Messages API); env vars `NQPR_TOPK_CAP`, `NQPR_LINK_REASONING_EFFORT`, `NQPR_LINK_COVERAGE_AUDIT`, `NQPR_LINK_AUDITOR`. |
+| **External deps** | `openai` (Responses API), `anthropic` (Messages API); env vars `NQPR_TOPK_CAP`, `NQPR_LINK_REASONING_EFFORT`, `NQPR_LINK_COVERAGE_AUDIT`, `NQPR_LINK_AUDITOR`, `NQPR_REASONING_EFFORT` (global fallback for reasoning effort). |
 | **How invoked** | Called from `causal_pipeline` stage 3.4 per causal link (parallel). |
 | **State between calls** | `accumulated_refs` list (local per call); no module-level mutable globals. |
 
@@ -342,8 +351,11 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | Builds `InvestmentEvidencePack` for one investment using 4-strategy retrieval (LLM-generated queries, hardcoded fallback, doc-type-specific, strategy doc queries); reranks combined pool; computes deterministic local scores; detects fact contradictions. |
-| **Inputs** | `build_evidence_pack(inv_id, timeline, tools, *, top_k, call_llm, model) → InvestmentEvidencePack` |
+| **What it does** | Builds `InvestmentEvidencePack` for one investment using 4-strategy retrieval; reranks combined pool; computes deterministic local scores; detects fact contradictions. **The previous 8-dimension rubric evaluation was removed** — the file now only contains `build_evidence_pack` and deterministic scoring helpers. |
+| **Inputs** | `build_evidence_pack(inv_id: str, timeline: InvestmentTimeline, tools: Any, *, top_k: int = 200, call_llm: Any = None, model: str = SYNTHESIS_MODEL) → InvestmentEvidencePack`. Default `top_k` is **200**, not 30. |
+| **Search method** | Calls `tools._embedding_index.search_with_filter(query, inv_id=inv_id, top_k=top_k)` directly — does **not** call any `CollectionTools.search()` method (no such method exists). |
+| **4 retrieval strategies** | **S1:** LLM generates 10 queries via `call_llm`; system `"Return ONLY a JSON array of search query strings. No explanation."`; model `SYNTHESIS_MODEL`; each query → `search_with_filter(query, inv_id=inv_id, top_k=top_k)`. Prompt template: `"Generate 10 diverse search queries to find evidence about this investment:\n\nOrganization: {org}\nTitle: {title}\nBOW: {bow_name}\nKey results: {key_results[:200]}\nTeam rationale: {team_rationale[:200]}\nFlags: {flags}\nDoc types present: {doc_types_present}\nDoc types missing: {doc_types_missing}\n\n...Return ONLY a JSON array of 10 query strings."` **S2:** 3 hardcoded doc-type-specific queries → `search_with_filter(query, inv_id=inv_id, top_k=50)`. **S3:** 5 strategy queries → `search_with_filter(query, collection="strategy", top_k=20)` (strategy collection only). **S4:** Rerank each pool separately; merge with guaranteed minimum of 20 strategy chunks (`inv_budget = top_k - 20 = 180`; rerank query `f"{org} {title} status risk financial progress"`). |
+| **Deterministic scorers** | `_detect_fact_contradictions` (checks `approved_amount` with 10% tolerance), `_score_disbursement_velocity` (green 0.70≤ratio≤2.0 / yellow / red <0.40 past 25%), `_compute_local_scores` (document_freshness, reporting_completeness, rationale_adequacy). |
 | **Outputs** | Returns `InvestmentEvidencePack`; no files written. |
 | **External deps** | `call_llm`, `InvestmentFacts.from_scoring_and_timeline`, `llm_utils.trace_llm_context`. |
 | **How invoked** | Called from `causal_pipeline` stage 3.1 (parallel, one call per investment). |
@@ -353,8 +365,9 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | Iterative, direction-neutral claim investigator (9 tools, up to `max_iterations=12`); dispatches tool actions in parallel via `ThreadPoolExecutor(8)`; stops on terminal status or 3 consecutive empty rounds. |
-| **Inputs** | `investigate_claim(claim, evidence_packs, tools, call_llm, *, model, max_iterations=12) → ClaimResult`; `run_claim_investigation(claims, evidence_packs, tools, call_llm, ...) → list[ClaimResult]` |
+| **What it does** | Iterative, direction-neutral claim investigator; dispatches tool actions in parallel; stops on terminal status or 3 consecutive empty rounds. Has its own tool set (distinct from `investigation_loop.py`): `search_bow`, `search_science`, `search_policy`, `search_all`, `search_web`, `read_pages`, `compute` — plus portfolio-level variants. **`_execute_actions` is imported by `science_investigator`** for its parallel action dispatch. |
+| **Inputs** | `investigate_claim(claim, evidence_packs, tools, call_llm, *, model: str = SYNTHESIS_MODEL, max_iterations: int = 12, scope_assessments=None, scope_timeline=None, program_context=None) → ClaimResult`; `run_claim_investigation(claims, evidence_packs, tools, call_llm, ...) → list[ClaimResult]` |
+| **ThreadPoolExecutor** | `ThreadPoolExecutor(max_workers=min(len(claims), 8))` — capped to the number of claims. |
 | **Outputs** | Returns `ClaimResult` / `list[ClaimResult]`; no files written. |
 | **External deps** | `openai`/`anthropic` via `call_llm`; `contextvars.ContextVar` (`_TRACE_CTX`). |
 | **How invoked** | `run_claim_investigation` called from `causal_pipeline` stage 3.4; `_execute_actions` imported by `science_investigator`. |
@@ -364,8 +377,12 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | Iterative science assumption investigator (Phase 3.5d Step 2); uses 8 tools including `search_asta` (Semantic Scholar 225M+ papers); enforces hard requirements before terminal states (must call ASTA, must attempt both confirming and disconfirming searches). |
-| **Inputs** | `investigate_science_question(question, question_index, tools, asta_client, call_llm, *, model, inv_id, org, title, bow_id, scope_id, max_iterations, ...) → ScienceInvestigationResult` |
+| **What it does** | Iterative science assumption investigator (Phase 3.5d Step 2); uses its own 8-tool set (NOT a superset of `investigation_loop.py` tools); enforces ASTA gate before terminal states; delegates parallel action dispatch to `claim_investigator._execute_actions`. |
+| **Inputs** | `investigate_science_question(question: ScienceQuestion, question_index: int, tools: Any, asta_client: Any, call_llm: Any, *, model: str = SYNTHESIS_MODEL, inv_id: str, org: str = "", title: str = "", bow_id: str \| None = None, scope_id: str \| None = None, max_iterations: int = 8, asta_soft_cap: int = 5, images: list[bytes] \| None = None) → ScienceInvestigationResult` |
+| **Tool set (8, distinct from investigation_loop)** | `search_asta`, `search_bow`, `search_science`, `search_policy`, `search_all`, `search_web`, `read_pages`, `compute`. Does NOT include `read_document`, `list_documents`, `read_document_summary`, `get_document_structure`, `read_section`, or `submit_findings`. |
+| **ASTA gate** | `asta_called_ever: bool` tracked across all iterations. If model returns `evidence_gathered` with `asta_called_ever=False`, a forced `search_asta` action is injected and the loop continues. Soft cap `asta_soft_cap=5`: silently skips further ASTA actions once reached. |
+| **Stop conditions** | Terminal status in `{"evidence_gathered", "insufficient_evidence", "blocked"}`, OR `max_iterations` reached, OR 3 consecutive iterations with zero new evidence chunks (`CONSECUTIVE_EMPTY_THRESHOLD=3` → force `insufficient_evidence`). |
+| **LLM call parameters** | `json_mode=False`, `max_tokens=8000`, `retry_on_anthropic_blank=True`. System prompt from `_SCIENCE_INVESTIGATE_SYSTEM` (= `_safety_preamble() + _TOOL_DESCRIPTIONS + ...`). |
 | **Outputs** | Returns `ScienceInvestigationResult`; no files written. |
 | **External deps** | `AstaClient` (Semantic Scholar); `claim_investigator._execute_actions`. |
 | **How invoked** | Called from `causal_pipeline` stage 3.5d per science assumption (parallel). |
@@ -375,12 +392,13 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | Phase 3.8 — aggregates per-link `LinkAssessment.leadership_options` into structured `Decision` objects per scope; applies evidence-weighted gating, ranks by composite score, caps at 3 per INV and 8 per scope. |
-| **Inputs** | `run_phase38(scope_outputs, call_llm, *, model, max_workers) → int` (mutates `ScopeOutput.decisions` in place) |
+| **What it does** | Phase 3.8 — aggregates per-link `LinkAssessment.leadership_options` into structured `Decision` objects per scope; applies evidence-weighted gating (`_section1a_gate`), ranks by composite score (`_compute_rank_score`), caps at 3 per INV and 8 per scope (`_apply_caps`). Called from `run_research_analyst`, NOT from `run_causal_pipeline`. |
+| **Inputs** | `run_phase38(scope_outputs, call_llm, *, model=ANALYSIS_MODEL, max_workers: int = 4) → int` (mutates `ScopeOutput.decisions` in place). Default `max_workers=4`. |
+| **Sanitize / gate / rank** | `_sanitize_candidate`: rejects if `decision_type` not in `DECISION_TYPE_VOCABULARY`, `recommended_action` empty, or `triggering_link_ids` empty. `_section1a_gate`: passes if type in `_THIN_EVIDENCE_DECISION_TYPES` OR confidence ≠ "low" OR corroboration_count ≥ 2. `_THIN_EVIDENCE_DECISION_TYPES = frozenset({"request_progress_packet", "validate_assumption"})`. `_compute_rank_score`: `cor × mat × max(log10(dollars+10), 1) × urg × evd`; maps materiality high=3/med=2/low=1, urgency immediate=4/near_term=3/medium_term=2/long_term=1, confidence high=3/med=2/low=1. |
 | **Outputs** | Returns int (total decisions); mutates passed-in `ScopeOutput` objects. |
 | **External deps** | `call_llm`; `evidence_model._THIN_EVIDENCE_DECISION_TYPES`; `concurrent.futures`. |
-| **How invoked** | Called from `research_analyst_agent` after Phase 3. |
-| **State between calls** | `DECISION_TYPE_VOCABULARY` (15 types), module-level (immutable). |
+| **How invoked** | Called from `research_analyst_agent` after Phase 3 (not inside `causal_pipeline`). |
+| **State between calls** | `DECISION_TYPE_VOCABULARY` (frozenset, 15 types), `_THIN_EVIDENCE_DECISION_TYPES` (frozenset, 2 types) — module-level (immutable). |
 
 ### `cluster_identification.py`
 
@@ -930,8 +948,8 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 | Field | Detail |
 |---|---|
 | **What it does** | Declares all LLM model name constants, each overridable via an env var; single source of truth for model routing across the pipeline. |
-| **Inputs** | Environment variables: `NQPR_ANALYSIS_MODEL`, `NQPR_SYNTHESIS_MODEL`, `NQPR_AGGREGATE_MODEL`, `NQPR_FAST_MODEL`, `NQPR_VISION_MODEL`, `NQPR_DEEP_WEB_MODEL`, `NQPR_VERIFICATION_MODEL`. |
-| **Outputs** | Module-level string constants (e.g. `ANALYSIS_MODEL=gpt-5.5`, `SYNTHESIS_MODEL=claude-opus-4-7`). |
+| **Inputs** | Environment variables: `NQPR_ANALYSIS_MODEL`, `NQPR_SYNTHESIS_MODEL`, `NQPR_AGGREGATE_MODEL`, `NQPR_FAST_MODEL`, `NQPR_VISION_MODEL`, `NQPR_DEEP_WEB_MODEL`, `NQPR_VERIFICATION_MODEL`, `NQPR_ANTHROPIC_FALLBACK_MODEL`. |
+| **Outputs** | Module-level string constants (hard-coded defaults when env var absent): `ANALYSIS_MODEL="gpt-5.5"`, `SYNTHESIS_MODEL="claude-opus-4-7"`, `AGGREGATE_MODEL="claude-opus-4-7"`, `FAST_MODEL="gpt-5.4-mini"`, `VISION_MODEL="gpt-5.5"`, `DEEP_WEB_MODEL="gpt-5.5"`, `VERIFICATION_MODEL="gpt-5.5"`, `ANTHROPIC_FALLBACK_MODEL="claude-sonnet-4-6"`. |
 | **How invoked** | `from src.qpr.model_defaults import ANALYSIS_MODEL`. |
 
 ### `evidence_model.py`
@@ -1052,12 +1070,18 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 | Field | Detail |
 |---|---|
 | **What it does** | Defines the `SearchIndex` protocol (runtime-checkable), `SearchResult` dataclass with legacy dict-mapping shim, `FilterSpec` frozen dataclass, and `RECENCY_BOOST_DOC_TYPES` constant. |
+| **`SearchResult` fields** | `chunk_id`, `text`, `score`, `file_id`, `inv_id`, `bow_id`, `page_start`, `page_end`, `doc_type`, `intelligence_version_group: str = ""`, `carve_out_metadata: dict \| None = None`, `origin_team: str = ""` (used for cross-corpus fan-out). |
+| **`SearchIndex` protocol methods** | `search_with_filter(query, *, top_k, inv_id, bow_id, collection, doc_type) → list[SearchResult]`; `hybrid_search(query, *, top_k, ...) → list[SearchResult]`; `distinct_inv_ids() → list[str]`; `distinct_bow_ids() → list[str]`; `count_by_bow_id() → dict[str, int]`. |
+| **`FilterSpec`** | Frozen dataclass; includes `supports_bow_id` flag for strict cross-cutting BoW link filtering. |
+| **`RECENCY_BOOST_DOC_TYPES`** | `{"progress_report", "final_report", "amendment", "milestone"}`. |
 
 ### `search/local.py`
 
 | Field | Detail |
 |---|---|
-| **What it does** | `LocalSearchIndex` — SQLite B-tree metadata + memmap numpy vectors + L2 norms; supports per-thread SQLite connections; auto-migrates/repairs on load. Default backend. |
+| **What it does** | `LocalSearchIndex` — SQLite B-tree metadata + memmap numpy vectors + L2 norms; supports per-thread SQLite connections; auto-migrates/repairs on load (auto-rebuilds `chunks.sqlite` from `chunks.json` when size mismatch detected). Default backend. |
+| **SQLite columns (full set)** | `chunk_id`, `text`, `file_id`, `inv_id`, `bow_id`, `page_start`, `page_end`, `doc_type`, `context`, `doc_date`, `intelligence_role`, `intelligence_action`, `intelligence_is_best`, `intelligence_version_group`, `intelligence_pass_status`, `content_tags`, `supports_bow_ids`, `topic_tags`, `carve_out_metadata`. |
+| **Recency boost** | `_RECENCY_BOOST_PER_YEAR = 0.00005`, `_RECENCY_BASELINE_YEAR = 2020`; applied in `hybrid_search` for doc types in `RECENCY_BOOST_DOC_TYPES`. |
 | **External deps** | `numpy`, `sqlite3`, `sklearn`. |
 | **State between calls** | Instance: `_conns: dict[int, Connection]`, `_conn_lock`, `sqlite_path`, `vectors`, `norms`. |
 
@@ -1065,7 +1089,8 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | `QdrantCollectionSearchIndex` wrapping qdrant-client with native hybrid (dense + sparse BM25) RRF via `query_points`. |
+| **What it does** | `QdrantCollectionSearchIndex` — server-side hybrid dense+sparse BM25 RRF via `client.query_points(prefetch=[dense, sparse], query=Fusion.RRF)`. RRF fusion is performed by the Qdrant server, not client-side. |
+| **Constructor** | `QdrantCollectionSearchIndex(collection_name, *, host="localhost", port=6333, url=None, api_key=None, embedding_model="text-embedding-3-small", team_name=None)`. `team_name` accepted for API symmetry but NOT used as a query filter. All env vars (`QDRANT_*`) are read by `load_collection`, not by this module. |
 | **External deps** | `qdrant_client`, `fastembed` (optional for BM25), `openai`. |
 | **State between calls** | `_sparse_model` (lazy), `_payload_cache` (lazy dict; instance-level). |
 
@@ -1073,9 +1098,12 @@ Generated from source-read of every Python file in `src/qpr/` (excluding `_archi
 
 | Field | Detail |
 |---|---|
-| **What it does** | `AzureSearchIndex` against foundation-wide `edp-idm-index` (WUS2 private endpoint); always uses `QueryType.SEMANTIC` + `VectorizableTextQuery` hybrid; monkey-patches socket DNS. |
+| **What it does** | `AzureSearchIndex` against foundation-wide `edp-idm-index` (`ais-eds-edp-idm-prd-wus2.search.windows.net`); always uses `QueryType.SEMANTIC` + `VectorizableTextQuery` hybrid. |
+| **Module-level side effect** | `socket.getaddrinfo` is monkey-patched **at import time** to pin the Azure private endpoint IPs — handles Warp/VPN DNS resolution races. |
+| **`_TEAM_ALIASES`** | Dict mapping short team names (e.g. `"dts"`) to full display names (e.g. `"Discovery and Translational Sciences"`) for cross-corpus aux fan-out. Short names without an alias entry return zero results. |
+| **`strict` parameter** | Primary backend: `strict=True` (raises on transient failure). Aux fan-out via `load_collection`: `strict=False` (tolerates failure, returns empty). |
 | **External deps** | `azure.search.documents`, `azure.identity`. |
-| **State between calls** | `_CREDENTIAL` (lazy), `_SEARCH_CLIENTS` dict (module-level). |
+| **State between calls** | `_CREDENTIAL: Any = None` (lazy singleton), `_SEARCH_CLIENTS: dict[str, Any] = {}` (module-level, shared across all instances). |
 
 ### `search/migrate.py`
 

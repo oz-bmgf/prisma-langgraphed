@@ -68,10 +68,11 @@ def test_pnd_matrix_returns_none_on_empty():
     assert result is None
 
 
-def test_pnd_matrix_returns_none_on_single_scope():
-    # Only 1 data point — total < 2 → returns None
+def test_pnd_matrix_single_scope_returns_png():
+    # 1 data point is enough to render the matrix
     result = render_confusion_matrix([_SCOPE_A], {})
-    assert result is None
+    assert result is not None
+    assert base64.b64decode(result)[:4] == b"\x89PNG"
 
 
 def test_pnd_matrix_investment_scoring_arg_is_accepted():
@@ -93,27 +94,34 @@ def test_pnd_matrix_three_scopes():
 
 
 def test_scatter_plot_returns_base64():
-    result = render_scatter_plot("BOW-01", [_SCOPE_A, _SCOPE_B], {})
+    result = render_scatter_plot([_SCOPE_A, _SCOPE_B], {})
     assert result is not None
     assert isinstance(result, str)
     decoded = base64.b64decode(result)
     assert decoded[:4] == b"\x89PNG"
 
 
-def test_scatter_plot_returns_none_single_point():
-    # Only one scope with valid data → fewer than 2 points → None
-    result = render_scatter_plot("BOW-01", [_SCOPE_A], {})
-    assert result is None
+def test_scatter_plot_single_point_returns_png():
+    # One valid scope → 1 plotable point → still returns a PNG
+    result = render_scatter_plot([_SCOPE_A], {})
+    assert result is not None
+    assert base64.b64decode(result)[:4] == b"\x89PNG"
 
 
 def test_scatter_plot_returns_none_on_empty():
-    result = render_scatter_plot("BOW-01", [], {})
+    result = render_scatter_plot([], {})
     assert result is None
+
+
+def test_scatter_plot_all_bows_in_one_plot():
+    # Scopes from different BOWs — all rendered in a single plot
+    result = render_scatter_plot([_SCOPE_A, _SCOPE_B, _SCOPE_C], {})
+    assert result is not None
+    assert base64.b64decode(result)[:4] == b"\x89PNG"
 
 
 def test_scatter_plot_custom_axes():
     result = render_scatter_plot(
-        "BOW-01",
         [_SCOPE_A, _SCOPE_B],
         {},
         x_axis="execution_rate",
@@ -142,6 +150,6 @@ def test_scatter_plot_falls_back_to_investment_scoring():
         "INV-010": {"execution_rate": 0.5, "approved_amount": 3_000_000.0},
         "INV-011": {"execution_rate": 0.7, "approved_amount": 6_000_000.0},
     }
-    result = render_scatter_plot("BOW-99", [scope_no_facts_a, scope_no_facts_b], scoring)
+    result = render_scatter_plot([scope_no_facts_a, scope_no_facts_b], scoring)
     assert result is not None
     assert base64.b64decode(result)[:4] == b"\x89PNG"

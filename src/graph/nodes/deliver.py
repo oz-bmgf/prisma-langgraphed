@@ -92,6 +92,16 @@ async def deliver(state: WorkflowState, config: RunnableConfig) -> dict:
             await asyncio.to_thread(_copy_file, pdf_src, pdf_dst)
             delivered.append(str(pdf_dst))
 
+    # ── appendix.pdf (copy if rerender produced one) ──────────────────────────
+    appendix_pdf_str: Optional[str] = state.get("appendix_pdf_path")
+    if appendix_pdf_str:
+        appendix_src = Path(appendix_pdf_str)
+        if appendix_src.exists():
+            appendix_dst = delivery_dir / "appendix.pdf"
+            # asyncio-APPROVED-1: to_thread wraps blocking shutil.copy2
+            await asyncio.to_thread(_copy_file, appendix_src, appendix_dst)
+            delivered.append(str(appendix_dst))
+
     # Also handle wresearch report if present
     wresearch_str: Optional[str] = state.get("final_report_wresearch_md_path")
     if wresearch_str:

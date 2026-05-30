@@ -75,8 +75,8 @@ src/
       research.py        ← 6-node research dispatch subgraph
   tools/
     collection_tools.py  ← CollectionToolNode (6 tools: search + retrieval only)
-    investigation_tools.py  ← InvestigationToolNode (10 tools)
-    science_tools.py     ← ScienceToolNode (extends Investigation + search_asta)
+    investigation_tools.py  ← InvestigationToolNode (12 tools — added search_bow/search_science/search_policy; submit_findings removed)
+    science_tools.py     ← ScienceToolNode (8 tools: search_asta + search_bow/science/policy/web + read_document/compute/read_section)
     narration_tools.py   ← NarrationToolNode (6 tools)
   backends/
     base.py              ← SearchBackend protocol + SearchResult dataclass

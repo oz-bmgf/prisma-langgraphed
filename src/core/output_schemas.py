@@ -231,9 +231,12 @@ class ForecastOutput(BaseModel):
 
 
 class InvestigationAction(BaseModel):
-    tool: str = Field(description="Tool name: search_investment|search_bow|search_doc_type|search_all|search_web|read_pages|compute")
-    query: str = Field(description="Natural-language question to research")
+    tool: str = Field(description="Tool name: search_investment|search_portfolio|search_bow|search_science|search_policy|search_doc_type|search_all|search_web|read_pages|read_document|compute|list_documents|read_document_summary|get_document_structure|read_section")
+    query: str = Field(description="Natural-language question or argument for the tool")
     doc_type: str | None = Field(default=None, description="Doc type filter for search_doc_type")
+    file_id: str | None = Field(default=None, description="Document file_id for read_document, read_pages")
+    page_start: int | None = Field(default=None, description="Start page for read_document/read_pages")
+    page_end: int | None = Field(default=None, description="End page for read_document/read_pages")
     rationale: str = Field(default="", description="Why this search is needed")
 
 
@@ -249,8 +252,8 @@ class InvestigationActionsOutput(BaseModel):
 
 
 class ScienceAction(BaseModel):
-    tool: str = Field(description="Tool: search_asta|search_web|search_investment|search_all")
-    query: str = Field(description="Search query")
+    tool: str = Field(description="Tool: search_asta|search_bow|search_science|search_policy|search_web|read_document|compute|read_section")
+    query: str = Field(description="Search query or question")
     rationale: str = Field(default="")
 
 
@@ -275,15 +278,16 @@ class DecisionCandidate(BaseModel):
         )
     )
     recommended_action: str = Field(description="Specific action leadership should take")
-    goal_link: str = Field(default="", description="Causal link this decision addresses")
+    goal_link: str = Field(default="", description="One sentence: how this serves the BoW's stated goal")
+    substitution_path: str = Field(default="", description="From necessity.substitutes: what absorbs the gap if this investment stops")
     triggering_link_ids: list[str] = Field(description="IDs of links that triggered this decision")
     triggering_evidence: list[str] = Field(default=[], description="Evidence items supporting this decision")
     corroboration_count: int = Field(ge=0, description="Number of independent evidence sources")
     cost_impact_dollars: float = Field(ge=0.0, description="Expected financial impact")
     timeline_impact_months: float = Field(ge=0.0, description="Expected timeline impact in months")
-    urgency: str = Field(description="immediate|near_term|medium_term|long_term")
-    materiality: str = Field(description="high|medium|low")
-    confidence: str = Field(description="high|medium|low")
+    urgency: str = Field(description="immediate|quarterly|annual_cycle")
+    materiality: str = Field(description="material|uncertain|not_material")
+    confidence: str = Field(description="high|moderate|low|insufficient")
     rationale: str = Field(default="", description="Evidence basis for this decision")
 
 

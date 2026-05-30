@@ -176,6 +176,10 @@ services:
       - "4317:4317"   # gRPC  — app connects here
       - "4318:4318"   # HTTP  — optional / debug
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 8g    # must exceed memory_limiter limit_mib (6144) + spike_limit_mib (1536)
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:13133/"]
       interval: 10s
@@ -183,7 +187,7 @@ services:
       retries: 3
 
   # ── Graph process ────────────────────────────────────────────────────────────
-  # Tracing flows to the local otel-collector via a single gRPC BatchSpanProcessor.
+  # Tracing flows to the local otel-collector via HTTP/Protobuf BatchSpanProcessor.
   # The collector fans out to Phoenix and Langfuse based on PHOENIX_*/LANGFUSE_*
   # env vars.  LangSmith remains on the native LANGCHAIN_TRACING_V2 SDK path.
 
@@ -198,7 +202,8 @@ services:
       NQPR_CHECKPOINT_POSTGRES_DSN: postgresql://langgraph:langgraph@postgres:5432/langgraph
       DATABASE_URL: postgresql://langgraph:langgraph@postgres:5432/langgraph
       OTEL_SERVICE_NAME: prisma-langgraphed
-      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4317
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
     depends_on:
       postgres:
         condition: service_healthy

@@ -24,9 +24,14 @@ logger = logging.getLogger(__name__)
 # Must be called once before any matplotlib.pyplot import.
 # Python 3.14 raises AttributeError on matplotlib.backends if use() is called
 # after pyplot has already been imported in the same process.
+# Pre-import matplotlib.pyplot here (at module load time) so the one-time
+# os.mkdir for cache dirs happens before LangGraph's blocking-call detector
+# is active. Without this, the first lazy import inside a request handler
+# triggers the detector and the chart is silently dropped.
 try:
     import matplotlib
     matplotlib.use("Agg")
+    import matplotlib.pyplot  # noqa: F401 — cache-dir mkdir at startup, not at request time
 except Exception:
     pass
 
@@ -116,8 +121,8 @@ def render_confusion_matrix(
         matrix[tm_idx][ai_idx] += 1
 
     total = sum(matrix[i][j] for i in range(n) for j in range(n))
-    if total < 2:
-        logger.warning("render_confusion_matrix: insufficient data (total=%d)", total)
+    if total < 1:
+        logger.warning("render_confusion_matrix: no data points")
         return None
 
     import numpy as np
@@ -166,23 +171,25 @@ def render_confusion_matrix(
 
 
 def render_scatter_plot(
-    bow_id: str,
     scope_outputs: list[dict],
     investment_scoring: dict,
     x_axis: str = "execution_rate",
     y_axis: str = "approved_amount",
+    title: str = "Portfolio",
 ) -> str | None:
-    """Per-BOW X-Y scatter of investment-level metrics as inline base64 PNG.
+    """Portfolio-wide X-Y scatter of investment-level metrics as inline base64 PNG.
 
-    Points are colored by AI-assessed severity. Labels show inv_id.
+    All BOWs are plotted together; points are colored by AI-assessed severity
+    and labeled with their inv_id. Passing a ``title`` prefix overrides the
+    default "Portfolio" heading.
 
     ``investment_scoring`` is consulted for approved_amount when
     investment_facts is missing or incomplete.
 
-    Returns base64 PNG string or None when fewer than 2 data points exist.
+    Returns base64 PNG string or None when there are no plottable data points.
     """
     if not scope_outputs:
-        logger.warning("render_scatter_plot(%s): empty scope_outputs", bow_id)
+        logger.warning("render_scatter_plot: empty scope_outputs")
         return None
 
     try:
@@ -228,8 +235,8 @@ def render_scatter_plot(
             "sev": sev,
         })
 
-    if len(points) < 2:
-        logger.warning("render_scatter_plot(%s): insufficient points (%d)", bow_id, len(points))
+    if len(points) < 1:
+        logger.warning("render_scatter_plot: no data points")
         return None
 
     # Scale y if it looks like raw dollars (>1000 → display in $M)
@@ -243,7 +250,7 @@ def render_scatter_plot(
     if x_axis == "execution_rate":
         x_label = "Execution Rate"
 
-    fig, ax = plt.subplots(figsize=(7, 5), dpi=120)
+    fig, ax = plt.subplots(figsize=(9, 6), dpi=120)
 
     seen_sev: set[str] = set()
     for p in points:
@@ -256,7 +263,7 @@ def render_scatter_plot(
 
     ax.set_xlabel(x_label, fontsize=10)
     ax.set_ylabel(y_label, fontsize=10)
-    ax.set_title(f"{bow_id} — {x_label} vs {y_label}", fontsize=11, fontweight="bold")
+    ax.set_title(f"{title} — {x_label} vs {y_label}", fontsize=11, fontweight="bold")
     ax.grid(linestyle="--", alpha=0.3)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)

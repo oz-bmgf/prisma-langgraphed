@@ -7,7 +7,7 @@ compatibility with any existing callers.
 Tracing destinations are controlled by the OTEL collector (see otel/ dir):
   - LangSmith: set LANGSMITH_API_KEY + LANGCHAIN_TRACING_V2=true
   - Langfuse:  set LANGFUSE_OTEL_BASIC_AUTH (base64 of pk:sk)
-  - Collector: OTEL_EXPORTER_OTLP_ENDPOINT (default http://localhost:4317)
+  - Collector: OTEL_EXPORTER_OTLP_ENDPOINT (default http://localhost:4318; SDK appends /v1/traces)
 """
 from __future__ import annotations
 

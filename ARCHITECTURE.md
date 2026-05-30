@@ -12,8 +12,9 @@ Design document for the LangGraph-native rewrite of the NQPR (quarterly portfoli
 
 1. [WorkflowState TypedDict](#1-workflowstate-typeddict)
 2. [Top-Level Graph Topology](#2-top-level-graph-topology)
-3. [Analyze Subgraph — 6 Internal Phases](#3-analyze-subgraph--6-internal-phases)
-4. [Causal Pipeline Subgraph — 8 Sub-Stages](#4-causal-pipeline-subgraph--8-sub-stages)
+2a. [Analyze Pipeline — Entry Point, End-to-End Flow, and Data Flow](#2a-analyze-pipeline--entry-point-end-to-end-flow-and-data-flow)
+3. [Analyze Subgraph — 8 Named Phases (LangGraph Design)](#3-analyze-subgraph--8-named-phases-langgraph-design)
+4. [Causal Pipeline Subgraph — 12+ Sub-Stages](#4-causal-pipeline-subgraph--12-sub-stages)
 5. [Research Dispatch Subgraph — Stage 4](#5-research-dispatch-subgraph--stage-4)
 6. [Async Node Function Signatures](#6-async-node-function-signatures)
 7. [Persistence Strategy](#7-persistence-strategy)
@@ -272,11 +273,227 @@ route_after_report_approval(state)       → "deliver" | "finalize"
 
 ---
 
-## 3. Analyze Subgraph — 6 Internal Phases
+## 2a. Analyze Pipeline — Entry Point, End-to-End Flow, and Data Flow
+
+This section documents the **old-repo** analyze pipeline as it runs today from `cli.py`, and maps each step to the LangGraph node that replaces it. Use this as the authoritative reference for control flow, data flow, collection-API search calls, branching, and termination when implementing the analyze subgraph.
+
+### Entry Point — `_cmd_analyze` in `cli.py`
+
+Invoked via `python -m src.qpr analyze --collection <name> [flags]`.
+
+**CLI flags forwarded to `run_research_analyst`:**
+
+| Flag | Parameter | Default |
+|---|---|---|
+| `--collection` | `collection_name` | required |
+| `--base-dir` | `base_dir` | `~/qpr-collections` |
+| `--output-dir` | `output_dir` | auto-generated |
+| `--model` | `synthesis_model` | `SYNTHESIS_MODEL = "claude-opus-4-7"` |
+| `--research-model` | `research_model` | `ANALYSIS_MODEL = "gpt-5.5"` |
+| `--focus` | `focus` | None |
+| `--focus-bows` | `focus_bows` | None |
+| `--aux-collections` | `aux_collections` | None |
+
+**`orientation_model` is NOT a CLI flag** — `run_research_analyst` accepts it as a keyword argument but the CLI never exposes or forwards it; it always uses its default `ANALYSIS_MODEL = "gpt-5.5"`.
+
+**`_cmd_analyze` execution order:**
+
+1. `_load_env()` — loads `.env` from working directory
+2. `_setup_logging(verbose)` — configures log level
+3. Sets `LLM_TRACE_FILE` env var → `{output_dir}/trace.jsonl` *(consumed by `llm_utils.call_llm` for full LLM call tracing)*
+4. Resolves `output_dir` → `{base_dir}/{collection}-experiments/run-{auto-name}/` if not provided (`auto-name` from `generate_run_name()`)
+5. **`load_collection(collection_name, base_dir, aux_collections)`** → `(CollectionTools tools, CollectionContext ctx)`
+   - Reads `NQPR_SEARCH_BACKEND` env var to select backend (`local` / `qdrant` / `azure`)
+   - Reads from `{base_dir}/{collection}-ingested/`: embedding index (`.npy` + `.sqlite`), `document_catalog.json`, `investment_scoring.json`, `bow_investment_map.json`, `investment_bow_rows.json`, `investment_intelligence.json`
+   - For each name in `aux_collections`: tries `LocalSearchIndex` from `{base_dir}/{aux}-ingested/embedding_index/`, falls back to `AzureSearchIndex(team=aux, strict=False)`
+6. If `aux_collections` provided: `build_asset_registry(...)` + `write_run_assets(...)` → writes `{output_dir}/assets.json`
+7. **`run_research_analyst(tools, call_llm, research_model=..., synthesis_model=..., focus=..., focus_bows=..., cache_dir={output_dir}/threads/)`** → `AnalystReport`
+8. Copy `threads/final_report.md` → `{output_dir}/final_report.md`
+9. Conditionally `md_to_pdf(...)` → `{output_dir}/final_report.pdf`
+10. Write `{output_dir}/run_meta.json`
+
+---
+
+### End-to-End Control Flow (Ordered)
+
+Sequential phase order inside `run_research_analyst`. Phase numbers match old-repo source; LangGraph mapping is in §9.
+
+**Phase 1 — Orientation**
+- **Reads:** `tools.list_bows()`, `tools.get_bow_summary(bow_id)` (top-N BOWs), doc_list, investment_scoring, investment_intelligence
+- **LLM call:** `orientation_model` (default `"gpt-5.5"`); produces `ProgramContext` with 7 fields: `theory_of_change`, `major_bets`, `stated_priorities`, `key_timelines`, `portfolio_health_signals`, `bow_summaries`, `initial_concerns`
+- **Produces:** `program_context: dict`
+- **Branching:** none
+
+**Phase 2 — Scope Computation** *(deterministic, no LLM)*
+- **Reads:** `program_context`, doc_list, `bow_investment_map`, `focus_bows` filter
+- **Logic:** groups investments by BOW; filters by chunk-count threshold; applies `focus_bows` restriction when set
+- **Produces:** `scopes: list[Scope]`
+- **Side effects:** writes `threads/scope_set.json`, `threads/checkpoint_initial.json`
+- **Branching:** `focus_bows` excludes non-matching BOWs; scopes with zero qualifying investments dropped
+
+**Phase 2.5 — Timeline Construction** *(deterministic, no LLM)*
+- **Reads:** `scopes`, doc_list, `investment_scoring`, `investment_intelligence`, `pages_dir`
+- **Produces:** `scope_timelines: dict[scope_id, ScopeTimeline]`
+
+**Phase 2.6 — Timeline Narratives** *(LLM, parallel per scope)*
+- **Reads:** `scope_timelines`; checks `{ingested_dir}/timeline_narratives.json` cache (SHA256-keyed)
+- **LLM call:** `research_model` (default `"gpt-5.5"`), one call per scope needing a narrative
+- **Produces:** narrative strings merged into `scope_timelines`
+- **Side effects:** writes/updates `{ingested_dir}/timeline_narratives.json`
+- **Branching:** scopes with a matching SHA256 cache entry are skipped — conditional `Send()` fan-out or passthrough edge
+- **Looping:** single LLM call per scope, no retry
+
+**Phase 3 — Causal Pipeline** *(delegates to `run_causal_pipeline`; see §4 for all 12+ sub-stages)*
+- **Reads:** `scopes`, `scope_timelines`, `tools`, `call_llm`, `program_context` (as `context`), `cache_dir`, `research_model`, `synthesis_model`
+- **Produces:** `list[ScopeOutput]` — each carrying causal_model, evidence_packs, link_assessments, science_results, synthesis, critique, gaps, necessity scores, bow_context
+- **Side effects:** per-scope checkpoint JSON files in `cache_dir`
+- **Branching (scope-level):** per-scope checkpoint exists → scope skipped (resume path)
+- **Looping:** see §4 sub-stage detail; investigation loops terminate on `status ∈ {answered, not_answerable, unresolved_conflict}` + empty `next_actions`, `max_iterations=40`, or 3 consecutive empty rounds
+
+**Phase 3.8 — Decision Projection** *(called from `run_research_analyst`, NOT inside `run_causal_pipeline`)*
+- **Reads:** `list[ScopeOutput]` returned by Phase 3
+- **LLM call:** `research_model`, `concurrent.futures.ThreadPoolExecutor(max_workers=4)` (one call per scope in parallel)
+- **Logic:** `_sanitize_candidate` → `_section1a_gate` → `_compute_rank_score` → `_apply_caps` (max 3 per INV, max 8 per scope); `_THIN_EVIDENCE_DECISION_TYPES = {"request_progress_packet", "validate_assumption"}` bypass the gate
+- **Produces:** mutates `ScopeOutput.decisions` in place; returns total decision count
+- **Branching:** `_sanitize_candidate` drops invalid structure; `_section1a_gate` drops low-confidence candidates not in thin-evidence types; `_apply_caps` drops lowest-ranked excess
+- **LangGraph note:** in the new design this phase moves inside the causal subgraph as `dispatch_decision_projections → project_scope_decisions → collect_decisions` (§4)
+
+**Phase 5 — Cross-Cutting Analysis** *(old-repo internal name: `_phase4_crosscut`)*
+- **Reads:** `list[ScopeOutput]`, `AnalystReport` draft, `investment_scoring`
+- **Pre-step:** `code_interpreter` call (OpenAI `ANALYSIS_MODEL = "gpt-5.5"`) → `portfolio_metrics` dict
+- **Tool calls:** `tools.get_bow_summary(bow_id)` for cross-scope context
+- **LLM call:** `synthesis_model` (default `"claude-opus-4-7"`); produces `CrossCuttingFindings` (patterns, contradictions, shared_dependencies, emergent_decisions, essay)
+- **Side effects:** writes `threads/checkpoint_after_phase5_crosscut.json`; calls cluster identification LLM (shortlist high-severity deviations → group into 3–5 thematic clusters) → stores in `state.clusters` and `cross_cutting_analysis["clusters"]` (not written to disk — LangGraph state replaces `threads/clusters.json`)
+- **Branching:** none
+
+**Phase 6a — Quality Assessment** *(deterministic, no LLM)*
+- **Reads:** `list[ScopeOutput]`
+- **Produces:** `coverage_pct: float`, `grade: "A"|"B"|"C"|"D"`, `confidence_map: dict[scope_id, "high"|"medium"|"low"]`
+- **Side effects:** writes `threads/checkpoint_after_phase6_quality.json`
+
+**Phase 6b — Report Assembly** *(up to 5 retries on structure validation failure)*
+- **Reads:** all scope_outputs, analyst_report, clusters, cross-cutting findings, investment_scoring, figures_dir
+- **LLM calls:** multiple per section (`synthesis_model`); exec summary via `premise_investigator` (uses OpenTelemetry spans; calls `AstaClient` for science assessment)
+- **Tool calls:** `NarrationToolbox` — `list_filtered_investments` + `search_within_scope` (3 queries) invoked by `_run_narration_pass` in `_build_executive_summary` before the final synthesis LLM call; `read_evidence_pack` available via `read_evidence_pack.ainvoke`; `read_page_image` for multimodal evidence
+- **Search calls:** `NarrationToolbox.search_within_scope` delegates to the collection embedding index
+- **Produces:** `final_report.md` Markdown string (ToC, portfolio dashboard, per-BOW sections, cross-cutting, bibliography, appendices)
+- **Side effects:** writes `{threads_dir}/final_report.md`; writes `{threads_dir}/excerpts.csv` (16-column §-ref bibliography CSV from `all_excerpts`); sets `excerpts_csv_path` in state
+- **Looping:** no outer retry loop in current implementation (F-029 open)
+
+**Post-run — Allocation + Numerical Verifiers**
+- `allocation_verifier.verify_and_rewrite(...)` → reads `final_report.md`; writes `threads/allocation_verification.json`, `threads/allocation_issues.md`
+- `numerical_verifier.verify_report(...)` → reads `final_report.md` + `excerpts.csv`; writes `threads/numerical_provenance.json`, `threads/verification_sources.json`, `threads/numerical_verification.json`
+
+---
+
+### End-to-End Mermaid Diagram
+
+```mermaid
+flowchart TD
+    CLI["_cmd_analyze(args)\ncli.py"]
+    LOAD["load_collection()\n→ (tools, ctx)\nreads {collection}-ingested/ from disk\nNQPR_SEARCH_BACKEND selects backend"]
+    ASSET["build_asset_registry()\nwrite_run_assets() → assets.json\n[only if --aux-collections]"]
+    P1["Phase 1 — Orientation\nLLM: orientation_model = gpt-5.5\ntools.list_bows() + get_bow_summary()\n→ program_context (7 fields)"]
+    P2["Phase 2 — Scope Computation\nDeterministic — no LLM\nfocus_bows filter applied\n→ scopes list\nwrites scope_set.json"]
+    P25["Phase 2.5 — Timeline Construction\nDeterministic — no LLM\n→ scope_timelines"]
+    P26["Phase 2.6 — Timeline Narratives\nLLM: research_model = gpt-5.5\nSend() per scope; SHA256 cache skip\nwrites timeline_narratives.json"]
+    P3["Phase 3 — Causal Pipeline\nrun_causal_pipeline()\n12+ sub-stages — see §4\nwrites per-scope checkpoints"]
+    P38["Phase 3.8 — Decision Projection\nrun_phase38() ← called HERE in run_research_analyst\nnot inside run_causal_pipeline\nLLM: research_model, 4 parallel workers\nmutates ScopeOutput.decisions"]
+    P5["Phase 5 — Cross-Cutting\nold-repo: _phase4_crosscut\ncode_interpreter + LLM: synthesis_model = claude-opus-4-7\ntools.get_bow_summary()\nwrites clusters.json"]
+    P6A["Phase 6a — Quality Assessment\nDeterministic\n→ coverage_pct, grade, confidence_map"]
+    P6B["Phase 6b — Report Assembly\nLLM: synthesis_model, up to 5 retries\nNarrationToolbox (6 tools)\npremise_investigator (ASTA calls)"]
+    POST["Post-run Verifiers\nallocation_verifier + numerical_verifier\nwrites allocation/numerical JSON"]
+    DONE["Returns AnalystReport\ncli: copies final_report.md + renders PDF\nwrites run_meta.json"]
+
+    CLI --> LOAD
+    LOAD -->|"--aux-collections set"| ASSET
+    ASSET --> P1
+    LOAD --> P1
+    P1 --> P2
+    P2 --> P25
+    P25 --> P26
+    P26 -->|"SHA256 cache miss → Send()\ncache hit → passthrough"| P26
+    P26 --> P3
+    P3 -->|"scope checkpoint exists → skip scope"| P3
+    P3 --> P38
+    P38 --> P5
+    P5 --> P6A
+    P6A --> P6B
+    P6B -->|"validation fails → retry\nmax 5 attempts"| P6B
+    P6B --> POST
+    POST --> DONE
+```
+
+---
+
+### Collection-API Search Calls — Explicit Mapping
+
+Every point in the analyze pipeline where the collection index is queried:
+
+| Phase | Sub-stage | Call site | Method / tool | Parameters |
+|---|---|---|---|---|
+| 1 | Orientation | `orientation` node | `tools.list_bows()` | No filter |
+| 1 | Orientation | `orientation` node | `tools.get_bow_summary(bow_id)` | Per BOW |
+| 3.1 | Rubric evaluation | `rubric_evaluator.build_evidence_pack` | `tools._embedding_index.search_with_filter(query, inv_id=inv_id, top_k=200)` | **S1** — 10 LLM-generated queries, investment scope |
+| 3.1 | Rubric evaluation | `rubric_evaluator.build_evidence_pack` | `tools._embedding_index.search_with_filter(query, inv_id=inv_id, top_k=50)` | **S2** — 3 hardcoded doc-type queries, investment scope |
+| 3.1 | Rubric evaluation | `rubric_evaluator.build_evidence_pack` | `tools._embedding_index.search_with_filter(query, collection="strategy", top_k=20)` | **S3** — 5 strategy queries, strategy collection only |
+| 3.1 | Rubric evaluation | `rubric_evaluator.build_evidence_pack` | `tools._embedding_index.hybrid_search(rerank_query, top_k=200)` | **S4** — rerank: `"{org} {title} status risk financial progress"` |
+| 3.4 | Link investigation | `investigation_loop.run_investigation` | `search_investment` tool | Scoped to `inv_id`; `top_k` capped by `NQPR_TOPK_CAP` env var |
+| 3.4 | Link investigation | `investigation_loop.run_investigation` | `search_portfolio` tool | Full portfolio index; fans out to aux backends via `cross_corpus_fanout` when registered |
+| 3.5d | Science investigation | `science_investigator.investigate_science_question` | `search_bow` tool | Scoped to BOW |
+| 3.5d | Science investigation | `science_investigator.investigate_science_question` | `search_science` / `search_policy` / `search_all` tools | Various collection scopes |
+| 5 | Cross-cutting | `cross_cutting_analysis` node | `tools.get_bow_summary(bow_id)` | Per BOW |
+| 6b | Report assembly | `NarrationToolbox.search_within_scope` | `tools.search(query, ...)` | Scoped to current lens scope |
+
+> **Rubric evaluator bypasses `CollectionTools.search()`:** `build_evidence_pack` calls `tools._embedding_index.search_with_filter()` and `hybrid_search()` directly, giving it fine-grained control over `collection="strategy"` scoping and `top_k` per strategy. All investigation agents use named tools (`search_investment`, `search_portfolio`, `search_bow`, etc.) which internally route through the same embedding index.
+
+---
+
+### State and Data Carried Between Phases
+
+| Phase | Produces | Consumed by |
+|---|---|---|
+| `load_collection` | `tools`, `ctx`, `investment_scoring`, `bow_investment_map`, `investment_intelligence`, `doc_list` | All phases |
+| Phase 1 | `program_context` (7 fields) | Phase 2, Phase 3 (passed as `context`) |
+| Phase 2 | `scopes: list[Scope]`; `threads/scope_set.json`; `threads/checkpoint_initial.json` | Phases 2.5, 3 |
+| Phase 2.5 | `scope_timelines: dict[scope_id, ScopeTimeline]` | Phases 2.6, 3 |
+| Phase 2.6 | Narrative strings in `scope_timelines`; `{ingested_dir}/timeline_narratives.json` | Phase 3 |
+| Phase 3 | `scope_outputs: list[ScopeOutput]`; per-scope checkpoint JSONs in `cache_dir` | Phases 3.8, 5 |
+| Phase 3.8 | `ScopeOutput.decisions` (mutated in-place) | Phases 5, 6b |
+| Phase 5 | `CrossCuttingFindings`; `clusters: list[ThematicCluster]`; `threads/clusters.json`; `threads/checkpoint_after_phase5_crosscut.json` | Phase 6b |
+| Phase 6a | `coverage_pct`, `grade`, `confidence_map`; `threads/checkpoint_after_phase6_quality.json` | Phase 6b |
+| Phase 6b | `final_report.md`; `threads/analyst_report.json`; `threads/scope_outputs.json`; `{output_dir}/excerpts.csv`; `threads/checkpoint_final.json` | Post-run verifiers; cli (copy + PDF render) |
+| Post-run | `threads/allocation_verification.json`; `threads/allocation_issues.md`; `threads/numerical_provenance.json`; `threads/numerical_verification.json`; `threads/verification_sources.json` | Human review; `prepare-research` stage reads `final_report.md` |
+
+---
+
+### Branching, Looping, and Termination
+
+| Location | Type | Condition | Outcome |
+|---|---|---|---|
+| Phase 2 | Branch | `focus_bows` is set | Only matching BOWs become scopes; all others excluded |
+| Phase 2 | Branch | Scope chunk count below threshold | Scope silently dropped |
+| Phase 2.6 | Conditional fan-out | SHA256 cache hit in `timeline_narratives.json` | Scope skipped; passthrough edge used instead of `Send()` |
+| Phase 3 (scope-level) | Branch | Per-scope checkpoint JSON exists in `cache_dir` | Scope skipped; `_run_one_scope` returns cached `ScopeOutput` |
+| Phase 3 — sub-stage 3.4 | Loop | Per-link investigation (`run_investigation`) | Continues until `status ∈ {answered, not_answerable, unresolved_conflict}` + `next_actions=[]`, `max_iterations=40` reached, or 3 consecutive empty rounds |
+| Phase 3 — sub-stage 3.5d | Loop | Per-assumption investigation (`investigate_science_question`) | Continues until terminal status, `max_iterations=8`, or 3 empty rounds; ASTA gate forces `search_asta` call if never invoked |
+| Phase 3.8 | Branch | `_sanitize_candidate` | Drops candidates with invalid type, empty action, or empty link IDs |
+| Phase 3.8 | Branch | `_section1a_gate` | Drops low-confidence candidates not in `_THIN_EVIDENCE_DECISION_TYPES` |
+| Phase 3.8 | Cap | `_apply_caps` | Drops lowest-ranked excess beyond 3 per INV / 8 per scope |
+| Phase 6b | Retry loop | Report structure validation fails | Re-runs assembly; max 5 retries; returns partial on exhaustion |
+| `run_investigation` | Early return | `InvestigationActionsOutput.status ∈ {answered, not_answerable, unresolved_conflict}` + `next_actions=[]` | Loop terminates; `InvestigationResult` returned |
+| `run_investigation` | Forced termination | 3 consecutive iterations with no new evidence chunks | Returns with best available result |
+| `investigate_science_question` | Forced gate | `evidence_gathered` returned with `asta_called_ever=False` | Injects forced `search_asta` action; loop continues |
+
+---
+
+## 3. Analyze Subgraph — 8 Named Phases (LangGraph Design)
 
 `analyze` compiles to a nested `StateGraph` typed against `AnalyzeState`. All nodes are async.
 
 `AnalyzeState` is a standalone `TypedDict` — not a subclass of `WorkflowState`. The parent graph passes a projection of `WorkflowState` in and merges the subgraph's return value back out via LangGraph's subgraph input/output mapping.
+
+> **Phase numbering:** the analyze subgraph spans Phases 0–6b, with several sub-phases (2.5, 2.6, 2.7, 3.5, 3.6, 6b). The "8" in the section heading counts the major named phases at the subgraph edge level; the causal pipeline (Phase 3) has its own 12+ internal sub-stages documented in §4.
 
 ### AnalyzeState TypedDict
 
@@ -435,9 +652,11 @@ Four nodes use conditional edges that return either a list of `Send()` objects (
 
 ---
 
-## 4. Causal Pipeline Subgraph — 8 Sub-Stages
+## 4. Causal Pipeline Subgraph — 12+ Sub-Stages
 
 The causal pipeline is the computational core. It runs as a nested `StateGraph` inside `run_causal_pipeline`. Four stages use `Send()` for parallel fan-out.
+
+> **Old-repo stage count and ordering:** the old-repo `causal_pipeline.py` has 12+ numbered sub-stages inside `_run_one_scope`: 3.1 → 3.1a → 3.1b → 3.2 → 3.3 → 3.4 → 3.4b → 3.5 → 3.5b → 3.5c → 3.5d → 3.7 → **3.6** (BOW synthesis runs last despite the lower number). Phase 3.8 (decision projection) is called by `run_research_analyst` after `run_causal_pipeline` returns, not inside the causal pipeline itself. In the new LangGraph design, Phase 3.8 is absorbed into the causal subgraph as `dispatch_decision_projections → project_scope_decisions → collect_decisions`, and the BOW synthesis fan-out (3.5 / 3.6) is lifted into the analyze subgraph as Phases 3.5 and 3.6 (§3).
 
 ### CausalState fields
 
@@ -457,29 +676,32 @@ errors: Annotated[list[str], operator.add]
 
 ### Sub-stage nodes
 
-| Node | Sub-stage | Description | Fan-out? |
-|---|---|---|---|
-| `dispatch_rubric_evaluation` | 3.1 | Routing node: emits one `Send()` per investment | **Yes — Send()** |
-| `evaluate_investment_rubric` | 3.1 worker | Calls `rubric_evaluator.build_evidence_pack` async | Receives Send |
-| `collect_evidence_packs` | 3.1 reducer | Aggregates `evidence_packs`; computes InvestmentFacts (deterministic); builds scope contexts | Reducer |
-| `dispatch_bow_enrichment` | 3.1.5 | Routing node: emits one `Send()` per scope needing BOW context enrichment | **Yes — Send()** |
-| `enrich_bow_context_worker` | 3.1.5 worker | Web search for field landscape/benchmarks/regulatory; LLM synthesises BOWContext dict; returns `{"scope_outputs": [scope]}` | Receives Send |
-| `collect_bow_enrichment` | 3.1.5 reducer | Trivial join node (merge_scope_outputs reducer handles accumulation) | Reducer |
-| `forecast_consequences` | 3.2 | Causal model extraction + consequence forecasting per scope | No |
-| `dispatch_link_investigations` | 3.4 | Routing node: emits one `Send()` per causal link | **Yes — Send()** |
-| `investigate_link` | 3.4 worker | Calls `investigation_loop.run_investigation` async | Receives Send |
-| `collect_link_assessments` | 3.4 reducer | Aggregates `link_assessments`; organises by scope | Reducer |
-| `synthesize_findings` | 3.5 | Per-scope LLM synthesis over link assessments | No |
-| `critique_synthesis` | 3.5b | Steelman critique pass per scope | No |
-| `identify_gaps` | 3.5c | Gap analysis per scope | No |
-| `dispatch_science_investigations` | 3.5d | Routing node: emits one `Send()` per science assumption | **Yes — Send()** |
-| `investigate_science_assumption` | 3.5d worker | Calls `science_investigator.investigate_science_question` async | Receives Send |
-| `collect_science_results` | 3.5d reducer | Aggregates `science_results`; attaches to scope outputs | Reducer |
-| `necessity_check` | 3.7 | Necessity scoring per link per scope | No |
-| `dispatch_decision_projections` | 3.8 | Routing node: emits one `Send()` per scope | **Yes — Send()** |
-| `project_scope_decisions` | 3.8 worker | Runs `decision_projection` logic async per scope | Receives Send |
-| `collect_decisions` | 3.8 reducer | Aggregates `scope_decisions`; finalises `scope_outputs` | Reducer |
-| `clear_fanout_accumulators` | post-3.8 | Marker node: no state writes. Documents that accumulator fields (evidence_packs, link_assessments, science_results, scope_decisions) are intentionally not forwarded back to AnalyzeState — data is embedded in scope_outputs. | No |
+| Node | Sub-stage | Old-repo stage | Description | Fan-out? |
+|---|---|---|---|---|
+| `dispatch_rubric_evaluation` | 3.1 | 3.1 | Routing node: emits one `Send()` per investment | **Yes — Send()** |
+| `evaluate_investment_rubric` | 3.1 worker | 3.1 | Calls `rubric_evaluator.build_evidence_pack` async. **4 search strategies:** S1 — 10 LLM-generated queries via `search_with_filter(inv_id=inv_id, top_k=200)`; S2 — 3 hardcoded doc-type queries via `search_with_filter(inv_id=inv_id, top_k=50)`; S3 — 5 strategy queries via `search_with_filter(collection="strategy", top_k=20)`; S4 — rerank pass via `hybrid_search`. All calls go through `tools._embedding_index` directly, bypassing `CollectionTools.search()`. | Receives Send |
+| `collect_evidence_packs` | 3.1 reducer | 3.1 | Aggregates `evidence_packs`; computes InvestmentFacts (deterministic); builds scope contexts | Reducer |
+| `extract_bow_causal_models` | 3.1a | 3.1a (old-repo) | BOW-level causal model extraction via `causal_model.extract_causal_model`; synthesises BOW-scope theory-of-change from aggregated investment chunks | No |
+| `frame_investment_links` | 3.1b | 3.1b (old-repo) | Maps per-investment causal links into cross-scope `InvestigationClaim` objects for link investigation fan-out | No |
+| `dispatch_bow_enrichment` | 3.1.5 | 3.3 (old-repo) | Routing node: emits one `Send()` per scope needing BOW context enrichment | **Yes — Send()** |
+| `enrich_bow_context_worker` | 3.1.5 worker | 3.3 (old-repo) | Web search for field landscape/benchmarks/regulatory context; LLM synthesises `BOWContext` dict; returns `{"scope_outputs": [scope]}` | Receives Send |
+| `collect_bow_enrichment` | 3.1.5 reducer | 3.3 (old-repo) | Trivial join node (`merge_scope_outputs` reducer handles accumulation) | Reducer |
+| `forecast_consequences` | 3.2 | 3.2 | Consequence forecasting per investment (parallel via `causal_model.forecast_consequences`); clips `dollars_at_risk` at `approved_amount` (Basel-EAD); aggregates with `max()` per link | No |
+| `dispatch_link_investigations` | 3.4 | 3.4 | Routing node: emits one `Send()` per causal link across all scopes | **Yes — Send()** |
+| `investigate_link` | 3.4 worker | 3.4 | Calls `investigation_loop.run_investigation(...)` async. **12 tools (INVESTIGATION_TOOLS):** `search_investment`, `search_portfolio`, `search_bow`, `search_science`, `search_policy`, `search_web`, `read_document`, `read_section`, `compute`, `list_documents`, `read_document_summary`, `get_document_structure`. `submit_findings` removed — loop terminates via `status ∈ {answered, not_answerable, unresolved_conflict}` + `next_actions=[]`, `max_iterations=40`, or 3 consecutive empty rounds. | Receives Send |
+| `collect_link_assessments` | 3.4 reducer | 3.4 | Aggregates `link_assessments`; organises by scope | Reducer |
+| `investigate_orphan_links` | 3.4b | 3.4b (old-repo) | Investigates unfunded causal gaps (BOW links with no investment backing) | No |
+| `synthesize_findings` | 3.5 | 3.5 | Per-scope LLM synthesis over link assessments; `synthesis_model` | No |
+| `critique_synthesis` | 3.5b | 3.5b | Steelman critique pass per scope; `synthesis_model` | No |
+| `identify_gaps` | 3.5c | 3.5c | Gap analysis per scope; `synthesis_model` | No |
+| `dispatch_science_investigations` | 3.5d | 3.5d | Routing node: emits one `Send()` per flagged science assumption | **Yes — Send()** |
+| `investigate_science_assumption` | 3.5d worker | 3.5d | Calls `science_investigator.investigate_science_question` async. **Own 8-tool set (SCIENCE_TOOLS):** `search_asta`, `search_bow`, `search_science`, `search_policy`, `search_web`, `read_document`, `compute`, `read_section`. `submit_findings` and document-nav tools excluded (conflict with `evidence_gathered` termination). ASTA gate: forces `search_asta` call if `evidence_gathered` returned with `asta_called_ever=False`. Soft cap: `asta_soft_cap=5`. Terminates on terminal status, `max_iterations=8`, or 3 empty rounds. | Receives Send |
+| `collect_science_results` | 3.5d reducer | 3.5d | Aggregates `science_results`; attaches to scope outputs | Reducer |
+| `necessity_check` | 3.7 | 3.7 | Necessity scoring per link per scope; `synthesis_model` | No |
+| `dispatch_decision_projections` | 3.8 | *(lifted from caller)* | Routing node: emits one `Send()` per scope. **In old-repo, `run_phase38` was called by `run_research_analyst` after `run_causal_pipeline` returned; in new design it is absorbed here.** | **Yes — Send()** |
+| `project_scope_decisions` | 3.8 worker | *(lifted from caller)* | Runs `decision_projection.project_decisions` async per scope; sanitise → gate → rank → cap (max 3 per INV, max 8 per scope) | Receives Send |
+| `collect_decisions` | 3.8 reducer | *(lifted from caller)* | Aggregates `scope_decisions`; finalises `scope_outputs` | Reducer |
+| `clear_fanout_accumulators` | post-3.8 | — | Marker node: no state writes. Documents that `evidence_packs`, `link_assessments`, `science_results`, `scope_decisions` are intentionally not forwarded back to `AnalyzeState` — data is embedded in `scope_outputs`. | No |
 
 ### Causal pipeline subgraph edges
 
@@ -1084,22 +1306,34 @@ All interrupt points use `langgraph.types.interrupt()`. The interrupt value is t
 | Original CLI command | Original handler | LangGraph node / subgraph |
 |---|---|---|
 | `python -m src.qpr precheck` | `_cmd_precheck → run_checks` | `precheck` node |
-| `python -m src.qpr analyze` | `_cmd_analyze → run_research_analyst` | `analyze` node → analyze subgraph |
-| — Phase 1 | orientation | `orientation` node |
-| — Phase 2 | scope computation + thread design | `compute_scopes` node |
-| — Phase 2.5 | timeline construction | `build_timelines` node |
-| — Phase 2.6 | narrative fan-out | `dispatch_timeline_narratives` → `generate_scope_narrative` |
-| — Phase 2.7 | narrative reduce | `collect_timeline_narratives` node |
+| `python -m src.qpr analyze` | `_cmd_analyze → load_collection → run_research_analyst` | `load_collection` node → `analyze` node → analyze subgraph |
+| — CLI flags | `--model` (synthesis), `--research-model`, `--focus`, `--focus-bows`, `--aux-collections` | `WorkflowState` fields `synthesis_model`, `research_model`, `focus`, `focus_bows`, `aux_collections` |
+| — `orientation_model` | **Not a CLI flag** — always `ANALYSIS_MODEL` default in old-repo | `state["research_model"]` used for orientation in new design (no separate orientation_model field) |
+| — Phase 1 | `_phase1_orient` | `orientation` node |
+| — Phase 2 | `_compute_thread_scopes` | `compute_scopes` node |
+| — Phase 2.5 | `build_scope_timeline` (in `investment_timeline`) | `build_timelines` node |
+| — Phase 2.6 | `build_timeline_narratives` fan-out | `dispatch_timeline_narratives` → `generate_scope_narrative` |
+| — Phase 2.7 | narrative merge + cache write | `collect_timeline_narratives` node |
 | — Phase 3 | `causal_pipeline.run_causal_pipeline` | `run_causal_pipeline` → causal pipeline subgraph |
-| — Phase 3.1 | `rubric_evaluator.build_evidence_pack` | `dispatch_rubric_evaluation` → `evaluate_investment_rubric` |
-| — Phase 3.4 | `investigation_loop.run_investigation` | `dispatch_link_investigations` → `investigate_link` |
-| — Phase 3.5d | `science_investigator.investigate_science_question` | `dispatch_science_investigations` → `investigate_science_assumption` |
-| — Phase 3.5 | AI-vs-team verdict synthesis | `dispatch_investment_reports` → `build_investment_report_worker` |
-| — Phase 3.6 | Section draft per scope | `dispatch_scope_sections` → `synthesize_scope_section_worker` |
-| — Phase 3.8 | `decision_projection.run_phase38` | `dispatch_decision_projections` → `project_scope_decisions` |
-| — Phase 5 | `_phase4_crosscut` | `cross_cutting_analysis` node |
+| — Phase 3.1 | `rubric_evaluator.build_evidence_pack` (4 strategies via `_embedding_index` directly) | `dispatch_rubric_evaluation` → `evaluate_investment_rubric` |
+| — Phase 3.1a | BOW-level `causal_model.extract_causal_model` | `extract_bow_causal_models` node |
+| — Phase 3.1b | Investment link mapping | `frame_investment_links` node |
+| — Phase 3.2 | `causal_model.forecast_consequences` | `forecast_consequences` node |
+| — Phase 3.3 (old) | BOW context enrichment | `dispatch_bow_enrichment` → `enrich_bow_context_worker` |
+| — Phase 3.4 | `investigation_loop.run_investigation` (10 tools) | `dispatch_link_investigations` → `investigate_link` |
+| — Phase 3.4b (old) | Orphan BOW link investigation | `investigate_orphan_links` node |
+| — Phase 3.5 (synthesis) | Per-scope LLM synthesis | `synthesize_findings` node |
+| — Phase 3.5b | Critique pass | `critique_synthesis` node |
+| — Phase 3.5c | Gap analysis | `identify_gaps` node |
+| — Phase 3.5d | `science_investigator.investigate_science_question` (own 8-tool set) | `dispatch_science_investigations` → `investigate_science_assumption` |
+| — Phase 3.7 | Necessity check | `necessity_check` node |
+| — Phase 3.8 | `decision_projection.run_phase38` — **called from `run_research_analyst` in old-repo, NOT inside `run_causal_pipeline`** | Absorbed into causal subgraph: `dispatch_decision_projections` → `project_scope_decisions` |
+| — Phase 3.5 (reports) | AI-vs-team verdict synthesis (called from analyze subgraph, not causal) | `dispatch_investment_reports` → `build_investment_report_worker` |
+| — Phase 3.6 (sections) | Section draft per scope (called from analyze subgraph, not causal) | `dispatch_scope_sections` → `synthesize_scope_section_worker` |
+| — Phase 5 | `_phase4_crosscut` + `code_interpreter` + `cluster_identification` | `cross_cutting_analysis` node |
 | — Phase 6a | `_phase5_quality` | `quality_assessment` node |
-| — Phase 6b | `report_assembler.assemble_report` | `assemble_report` node |
+| — Phase 6b | `report_assembler.assemble_report` (up to 5 retries) | `assemble_report` node |
+| — Post-run | `allocation_verifier` + `numerical_verifier` | `verify_report` node |
 | `python -m src.qpr prepare-research` | `_cmd_prepare_research → build_research_plan` | `prepare_research` node |
 | `python -m src.qpr research` | `_cmd_research → dispatch_research` | `research` node → research dispatch subgraph |
 | — SLR tasks | `ResearchAgent` | `slr_worker` node |
@@ -1143,7 +1377,7 @@ Used by `investigate_link` worker nodes and `claim_investigator`.
 | `search_web` | Web search via OpenAI Responses API |
 | `read_document` | Read full text of a document by `file_id` |
 | `compute` | Execute sandboxed Python via OpenAI `code_interpreter` |
-| `submit_findings` | Terminal tool: LLM submits investigation results to close the loop |
+| ~~`submit_findings`~~ | Removed from INVESTIGATION_TOOLS — loop terminates via status field, not sentinel |
 | `list_documents` | List all documents available for an investment |
 | `read_document_summary` | Return the LLM-generated summary of a document |
 | `get_document_structure` | Return section headers and page ranges for a document |
@@ -1151,12 +1385,20 @@ Used by `investigate_link` worker nodes and `claim_investigator`.
 
 ### ScienceToolNode — from `science_investigator.py`
 
-Extends `InvestigationToolNode` with one additional tool.
+**Own 8-tool set (SCIENCE_TOOLS) — does NOT extend or inherit InvestigationToolNode.** The science investigator has its own tool vocabulary: `search_asta`, `search_bow`, `search_science`, `search_policy`, `search_web`, `read_document`, `compute`, `read_section`. Omits: `submit_findings` (conflicts with `evidence_gathered` termination), `list_documents`, `read_document_summary`, `get_document_structure`, `search_investment`, `search_portfolio`.
+
+Used by `investigate_science_assumption` worker nodes.
 
 | Tool name | Description |
 |---|---|
-| `search_asta` | Semantic Scholar (225M+ papers) via `AstaClient`; at least one call required before terminal |
-| *(all InvestigationToolNode tools)* | Inherited |
+| `search_asta` | Semantic Scholar (225M+ papers) via `AstaClient`; **ASTA gate enforced: at least one call required before `evidence_gathered` status** |
+| `search_bow` | Semantic search scoped to the BOW's chunk pool |
+| `search_science` | Semantic search over scientific literature collection |
+| `search_policy` | Semantic search over policy and regulatory documents |
+| `search_web` | Web search via OpenAI Responses API (`gpt-5.4`) |
+| `read_document` | Read full text by `file_id` + page range or section_id |
+| `compute` | Evaluate Python arithmetic (restricted namespace eval) |
+| `read_section` | Read a named section by `file_id` + `section_id` |
 
 ### NarrationToolNode — from `narration_tools.py`
 
@@ -1225,7 +1467,9 @@ When `aux_collections` is populated in state, the factory also builds aux `Searc
 
 ### search_collection tool (the canonical entry point)
 
-All tool nodes call `search_collection` — they do not call the backend directly. `search_collection` is the single `@tool`-decorated async function responsible for:
+All tool nodes call `search_collection` — they do not call the backend directly.
+
+> **Exception — rubric evaluator:** `rubric_evaluator.build_evidence_pack` calls `tools._embedding_index.search_with_filter()` and `hybrid_search()` directly (not through `search_collection` or any `@tool`-decorated function). This is because rubric evaluation is invoked as a pure core function from a causal subgraph node, not via a tool-calling LLM agent loop. In the new LangGraph design, the `evaluate_investment_rubric` node calls `build_evidence_pack` directly; the same direct `search_with_filter` / `hybrid_search` pattern is preserved inside that function. `search_collection` is the single `@tool`-decorated async function responsible for:
 
 1. Resolving the `SearchBackend` from `config["configurable"]`
 2. Applying any state-derived filters (e.g. `bow_id_filter` from the current scope)

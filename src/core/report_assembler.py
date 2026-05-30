@@ -80,6 +80,126 @@ _TIER_DISPLAY = {
 # ---------------------------------------------------------------------------
 
 
+async def _run_premise_investigation(
+    major_bets: list,
+    config: Any,
+    model: str,
+) -> str:
+    """Orphan 9 / F-033 — 3-pass per-bet ASTA scientific premise cascade.
+
+    Matches old exec_summary/premise_investigator.run_per_bet_investigation():
+    Pass 1: search_asta for each bet to gather scientific evidence.
+    Pass 2: extract key findings from the retrieved evidence.
+    Pass 3: synthesize a per-bet executive summary paragraph.
+
+    Returns a multi-paragraph string ready for injection into the exec summary.
+    Degrades gracefully — empty string if no ASTA access or no bets.
+    """
+    if not major_bets:
+        return ""
+
+    try:
+        from src.tools.science_tools import search_asta
+    except ImportError:
+        return ""
+
+    bet_paragraphs: list[str] = []
+
+    for bet_obj in major_bets[:5]:   # cap at 5 bets
+        if isinstance(bet_obj, dict):
+            bet_str = bet_obj.get("bet", "")
+            bows = bet_obj.get("bows", [])
+            amount = bet_obj.get("amount_approx", "")
+        else:
+            bet_str = str(bet_obj)
+            bows = []
+            amount = ""
+
+        if not bet_str:
+            continue
+
+        bet_label = bet_str[:80]
+        bows_str = f" (BOWs: {', '.join(bows[:3])})" if bows else ""
+        amount_str = f" ~{amount}" if amount else ""
+
+        # ── Pass 1: ASTA investigation ─────────────────────────────────────────
+        asta_evidence: list[str] = []
+        for query_suffix in [
+            f"{bet_str} evidence efficacy outcomes",
+            f"{bet_str} clinical trial results systematic review",
+        ]:
+            try:
+                result = await search_asta.ainvoke({"query": query_suffix[:200]}, config=config)
+                if result and not result.startswith(("(", "[ASTA")):
+                    asta_evidence.append(result[:1500])
+            except Exception:
+                pass
+
+        # ── Pass 2: key findings extraction ───────────────────────────────────
+        if asta_evidence:
+            findings_prompt = (
+                f"Strategic bet: {bet_label}{bows_str}{amount_str}\n\n"
+                f"Scientific evidence retrieved:\n"
+                + "\n\n---\n\n".join(asta_evidence[:2])
+                + "\n\nIn 2-3 sentences, what are the key scientific findings relevant to "
+                "this bet? Note evidence quality, gaps, and uncertainties."
+            )
+            try:
+                key_findings = str(await acall_llm(findings_prompt, model=model, config=config))[:600]
+            except Exception:
+                key_findings = "(insufficient scientific evidence)"
+        else:
+            key_findings = "(no external scientific evidence found in ASTA corpus)"
+
+        # ── Pass 3: per-bet exec summary paragraph ─────────────────────────────
+        para_prompt = (
+            f"Strategic bet: {bet_label}{bows_str}{amount_str}\n\n"
+            f"Science assessment: {key_findings}\n\n"
+            "Write one concise executive summary paragraph (3-4 sentences) for this "
+            "strategic bet. Assess the scientific evidence base, any critical gaps or "
+            "risks, and the implication for Foundation investment decisions. "
+            "Be specific and factual."
+        )
+        try:
+            paragraph = str(await acall_llm(para_prompt, model=model, config=config))[:700]
+            bet_paragraphs.append(f"**{bet_label}**\n\n{paragraph}")
+        except Exception:
+            bet_paragraphs.append(f"**{bet_label}**: (science assessment unavailable)")
+
+    return "\n\n".join(bet_paragraphs)
+
+
+async def _run_narration_pass(config: Any, model: str) -> str:
+    """F-032: Run a brief NarrationToolbox evidence-gathering pass before synthesis.
+
+    Calls list_filtered_investments + 3 search_within_scope queries to surface
+    cross-investment patterns. Degrades gracefully when search_backend is absent.
+    """
+    try:
+        from src.tools.narration_tools import list_filtered_investments, search_within_scope
+        configurable = ((config or {}).get("configurable") or {})
+        if not configurable.get("search_backend"):
+            return ""
+
+        parts: list[str] = []
+
+        inv_list = await list_filtered_investments.ainvoke({}, config=config)
+        parts.append(f"INVESTMENTS IN SCOPE:\n{inv_list[:1500]}")
+
+        for q in [
+            "program critical pathway altering risk high severity investments",
+            "science assumption evidence weak insufficient literature",
+            "execution milestone delivery delay partner capacity risk",
+        ]:
+            result = await search_within_scope.ainvoke({"query": q, "top_k": 3}, config=config)
+            parts.append(f"EVIDENCE — {q}:\n{result[:600]}")
+
+        return "\n\n".join(parts)
+    except Exception as exc:
+        logger.debug("narration pass failed (non-fatal): %s", exc)
+        return ""
+
+
 async def _build_executive_summary(
     cross_cutting: dict,
     scope_outputs: list[dict],
@@ -102,6 +222,19 @@ async def _build_executive_summary(
                     f"[severity={d.get('severity', 'unknown')}]"
                 )
 
+    # F-032: gather live evidence via NarrationToolbox before synthesis
+    narration_evidence = await _run_narration_pass(config, model)
+
+    # F-033 / Orphan 9: 3-pass per-bet ASTA scientific premise cascade
+    major_bets: list = cross_cutting.get("major_bets") or []
+    if not major_bets:
+        for s in scope_outputs[:5]:
+            bets = (s.get("program_context") or {}).get("major_bets") or []
+            if bets:
+                major_bets = bets
+                break
+    premise_evidence = await _run_premise_investigation(major_bets, config, model)
+
     prompt = (
         "You are writing the executive summary for a quarterly portfolio review report.\n\n"
         f"Portfolio: {scope_count} investments analysed, "
@@ -117,12 +250,16 @@ async def _build_executive_summary(
             f"  - {d.get('title', '?')}: {d.get('description', '')[:100]}"
             for d in cross_cutting.get("emergent_decisions", [])[:4]
         )
+        + (f"\n\nNARRATION EVIDENCE (from portfolio index):\n{narration_evidence}"
+           if narration_evidence else "")
+        + (f"\n\nPER-BET SCIENTIFIC PREMISE ASSESSMENT (3-pass ASTA investigation):\n{premise_evidence}"
+           if premise_evidence else "")
         + "\n\nWrite a 4-5 paragraph executive summary. Cover:\n"
         "1. Risk disagreements between AI assessment and team scores\n"
         "2. Material deviations by dollar volume and severity\n"
-        "3. Science and evidence dependencies at risk\n"
+        "3. Science and evidence dependencies at risk (draw on the per-bet science assessments above)\n"
         "4. Portfolio patterns and strategic implications\n\n"
-        "Be specific, factual, and action-oriented. No hedging."
+        "Be specific, factual, and action-oriented. Cite specific investments. No hedging."
     )
     try:
         result = await acall_llm(prompt, model=model, config=config)

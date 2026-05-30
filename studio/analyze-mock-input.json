@@ -13,5 +13,17 @@
   "link_assessments": [],
   "science_results": [],
   "scope_decisions": [],
+  "timeline_narrative_results": [],
+  "investment_narrative_results": [],
+  "all_excerpts": [],
+  "asta_traces": [],
+  "slr_traces": [],
+  "lbd_traces": [],
+  "deep_web_traces": [],
+  "edison_traces": [],
+  "web_search_traces": [],
+  "compute_traces": [],
+  "collection_search_traces": [],
+  "investigation_traces": [],
   "errors": []
 }
