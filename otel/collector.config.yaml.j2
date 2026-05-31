@@ -12,6 +12,9 @@ receivers:
         max_recv_msg_size_mib: 20
       http:
         endpoint: 0.0.0.0:4318
+        # Mirror the gRPC size increase: investigation LLM spans can exceed the
+        # default limit; 20 MiB matches max_recv_msg_size_mib on the gRPC receiver.
+        max_request_body_size: 20971520
 
 processors:
   memory_limiter:

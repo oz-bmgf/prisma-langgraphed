@@ -23,7 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from typing import Any
+from typing import Any, Optional
 
 from src.config import DEFAULT_SYNTHESIS_MODEL as _DEFAULT_MODEL
 from src.core.llm_utils import acall_llm
@@ -55,13 +55,147 @@ def _try_render_confusion_matrix(scope_outputs: list[dict]) -> str | None:
 def _try_render_bow_scatter(bow_id: str, scopes: list[dict]) -> str | None:
     """Execution-rate vs approved-amount scatter for one BOW as inline PNG snippet."""
     b64 = _render_scatter_plot(
-        bow_id, scopes, {},
+        scopes, {},
         x_axis="execution_rate",
         y_axis="approved_amount",
+        title=bow_id,
     )
     if b64 is None:
         return None
     return f"![{bow_id} scatter](data:image/png;base64,{b64})\n\n"
+
+
+def _try_render_portfolio_scatter(
+    scope_outputs: list[dict],
+    investment_scoring: dict,
+) -> str | None:
+    """Portfolio-wide execution-rate vs approved-amount scatter as inline base64 PNG snippet."""
+    b64 = _render_scatter_plot(scope_outputs, investment_scoring)
+    if b64 is None:
+        return None
+    return (
+        "**Execution Rate vs Approved Amount**\n\n"
+        f"![Portfolio scatter](data:image/png;base64,{b64})\n\n"
+        "*X = execution rate (paid/approved); Y = approved amount ($M). "
+        "Color = AI-assessed severity.*\n"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scoring Comparison (BoW-level divergence + confusion matrix + scatter)
+# ---------------------------------------------------------------------------
+
+
+def _build_scoring_comparison(
+    scope_outputs: list[dict],
+    investment_scoring: Optional[dict],
+) -> str:
+    """Build the ## Scoring Comparison section.
+
+    Mirrors old report_assembler.py ## Scoring Comparison content:
+      - BoW-level aggregate divergence table (sorted by at-risk dollars)
+      - Per-investment AI-vs-team verdict table (pathway-altering+ only)
+      - Team-vs-AI confusion matrix PNG
+      - Portfolio execution-rate scatter PNG
+    """
+    investment_scoring = investment_scoring or {}
+    parts = ["## Scoring Comparison\n"]
+    parts.append(
+        "*Verdict legend: **E** Exceeds · **M** Meets · **B** Below · "
+        "**T** Too Early to Tell · **—** Not rated.*\n"
+    )
+
+    # ── BoW-level divergence table ────────────────────────────────────────
+    bow_rows: dict[str, dict] = {}
+    for s in scope_outputs:
+        for bid in (s.get("bow_ids") or []):
+            if bid not in bow_rows:
+                bow_rows[bid] = {
+                    "label": (s.get("label") or bid)[:60],
+                    "inv_count": 0,
+                    "program_critical": 0,
+                    "pathway_altering": 0,
+                    "total_approved": 0.0,
+                    "at_risk_dollars": 0.0,
+                }
+            row = bow_rows[bid]
+            n_inv = len(s.get("inv_ids") or [s.get("inv_id", "")])
+            row["inv_count"] += n_inv
+            inv_report = s.get("investment_report") or {}
+            div_sev = (inv_report.get("divergence_severity") or "").lower()
+            if div_sev == "program_critical":
+                row["program_critical"] += 1
+            elif div_sev == "pathway_altering":
+                row["pathway_altering"] += 1
+            facts = s.get("investment_facts") or {}
+            approved = float(facts.get("approved_amount", 0) or 0)
+            row["total_approved"] += approved
+            if div_sev in ("program_critical", "pathway_altering"):
+                row["at_risk_dollars"] += approved
+
+    if bow_rows:
+        sorted_bows = sorted(bow_rows.items(), key=lambda x: -x[1]["at_risk_dollars"])
+        lines = ["**BoW-level scoring divergence** (sorted by dollars at pathway-altering+ risk)\n"]
+        lines.append("| BoW | Investments | AI Critical | AI Pathway | At-Risk ($M) |")
+        lines.append("|-----|------------|------------|-----------|-------------|")
+        for bid, r in sorted_bows:
+            at_risk_str = f"${r['at_risk_dollars'] / 1e6:.1f}M" if r["at_risk_dollars"] else "—"
+            lines.append(
+                f"| {r['label']} | {r['inv_count']} "
+                f"| {r['program_critical']} | {r['pathway_altering']} | {at_risk_str} |"
+            )
+        parts.append("\n".join(lines))
+        parts.append("")
+
+    # ── Per-investment divergence table (pathway-altering and program-critical) ──
+    diverging: list[dict] = []
+    for s in scope_outputs:
+        inv_report = s.get("investment_report") or {}
+        div_sev = (inv_report.get("divergence_severity") or "").lower()
+        if div_sev not in ("program_critical", "pathway_altering"):
+            continue
+        facts = s.get("investment_facts") or {}
+        inv_ids = s.get("inv_ids") or [s.get("inv_id", "")]
+        approved = float(facts.get("approved_amount", 0) or 0)
+        diverging.append({
+            "inv_id": inv_ids[0] if inv_ids else "?",
+            "approved": approved,
+            "team_exec": inv_report.get("team_execution_score", "—") or "—",
+            "ai_verdict": inv_report.get("overall_status", "—") or "—",
+            "ai_sev": inv_report.get("severity", "—") or "—",
+            "div_sev": div_sev,
+        })
+    diverging.sort(key=lambda x: -x["approved"])
+
+    if diverging:
+        lines = [
+            "**AI-vs-team scoring divergence** "
+            "(pathway-altering and program-critical investments)\n"
+        ]
+        lines.append("| Investment | Approved | Team Execution | AI Verdict | Severity |")
+        lines.append("|-----------|---------|---------------|-----------|---------|")
+        for d in diverging[:25]:
+            approved_str = f"${d['approved'] / 1e6:.1f}M" if d["approved"] else "—"
+            lines.append(
+                f"| **{d['inv_id']}** | {approved_str} | {d['team_exec']} "
+                f"| {d['ai_verdict']} | **{d['div_sev']}** |"
+            )
+        parts.append("\n".join(lines))
+        parts.append("")
+
+    # ── Team-vs-AI confusion matrix ───────────────────────────────────────
+    cm_snippet = _try_render_confusion_matrix(scope_outputs)
+    if cm_snippet:
+        parts.append(cm_snippet)
+        parts.append("")
+
+    # ── Portfolio scatter ─────────────────────────────────────────────────
+    scatter_snippet = _try_render_portfolio_scatter(scope_outputs, investment_scoring)
+    if scatter_snippet:
+        parts.append(scatter_snippet)
+        parts.append("")
+
+    return "\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -200,11 +334,26 @@ async def _run_narration_pass(config: Any, model: str) -> str:
         return ""
 
 
+def _strip_leading_heading(text: str) -> str:
+    """Remove the first line if it is a markdown heading (# … or ## …).
+
+    LLMs sometimes open their response with a section title that duplicates
+    the heading the assembler has already emitted (e.g. "## Executive Summary"
+    or "# Calibration"). Stripping it prevents double-headings and heading-
+    level conflicts in the final PDF.
+    """
+    lines = text.splitlines()
+    if lines and re.match(r"^#{1,6}\s", lines[0]):
+        return "\n".join(lines[1:]).lstrip("\n")
+    return text
+
+
 async def _build_executive_summary(
     cross_cutting: dict,
     scope_outputs: list[dict],
     model: str,
     config: Any = None,
+    program: str = "",
 ) -> str:
     metrics = cross_cutting.get("portfolio_metrics") or {}
     total_approved = float(metrics.get("total_approved_dollars", 0) or 0)
@@ -235,8 +384,9 @@ async def _build_executive_summary(
                 break
     premise_evidence = await _run_premise_investigation(major_bets, config, model)
 
+    program_label = program or "Portfolio"
     prompt = (
-        "You are writing the executive summary for a quarterly portfolio review report.\n\n"
+        f"You are writing the executive summary for the {program_label} quarterly portfolio review.\n\n"
         f"Portfolio: {scope_count} investments analysed, "
         f"${total_approved / 1e6:.1f}M approved, "
         f"${total_paid / 1e6:.1f}M paid, "
@@ -259,11 +409,13 @@ async def _build_executive_summary(
         "2. Material deviations by dollar volume and severity\n"
         "3. Science and evidence dependencies at risk (draw on the per-bet science assessments above)\n"
         "4. Portfolio patterns and strategic implications\n\n"
-        "Be specific, factual, and action-oriented. Cite specific investments. No hedging."
+        "Be specific, factual, and action-oriented. Cite specific investments. No hedging.\n"
+        "Do NOT add a heading or title line — output prose paragraphs only."
     )
     try:
         result = await acall_llm(prompt, model=model, config=config)
-        return result if isinstance(result, str) else str(result)
+        text = result if isinstance(result, str) else str(result)
+        return _strip_leading_heading(text)
     except Exception as exc:
         logger.warning("_build_executive_summary LLM failed: %s", exc)
         return cross_cutting.get("essay", "*Executive summary pending.*")[:2000]
@@ -504,6 +656,178 @@ def _build_appendices(
 
 
 # ---------------------------------------------------------------------------
+# Key Insights (per-bet LLM narrative with alignment verdicts)
+# ---------------------------------------------------------------------------
+
+
+async def _build_key_insights(
+    scope_outputs: list[dict],
+    cross_cutting: dict,
+    model: str,
+    config: Any = None,
+) -> str:
+    """Build the ## Key Insights section — per-bet narrative with alignment verdicts.
+
+    Mirrors old report_assembler.py ## Key Insights content:
+      - Alignment verdicts legend
+      - Per-bet analysis: deviations review, premises review, patterns review,
+        alignment verdict (confirms / requires update / invalidates / neutral)
+      - Cross-bet patterns
+      - Calibration paragraph
+    """
+    # Resolve major_bets from cross_cutting or scope program_context
+    major_bets: list = cross_cutting.get("major_bets") or []
+    if not major_bets:
+        for s in scope_outputs[:8]:
+            bets = (s.get("program_context") or {}).get("major_bets") or []
+            if bets:
+                major_bets = bets
+                break
+    # Fall back to clusters as bet-like groupings when no named bets available
+    if not major_bets:
+        for c in (cross_cutting.get("clusters") or []):
+            theme = c.get("theme", "")
+            if theme:
+                major_bets.append({
+                    "bet": theme,
+                    "bows": c.get("scope_ids") or [],
+                    "amount_approx": "",
+                })
+
+    if not major_bets and not scope_outputs:
+        return ""
+
+    parts = ["## Key Insights\n"]
+    parts.append(
+        "*Alignment verdicts — **confirms**: documented evidence supports "
+        "the stated strategic claim · **requires update**: the claim needs "
+        "revision given new evidence (the world has changed since it was written) · "
+        "**invalidates**: the claim is no longer tenable on the documented record · "
+        "**neutral**: no implication either direction this cycle.*\n"
+    )
+
+    # Group scopes by bow_id for fast lookup
+    bow_scope_map: dict[str, list[dict]] = {}
+    for s in scope_outputs:
+        for bid in (s.get("bow_ids") or [s.get("scope_id", "")]):
+            bow_scope_map.setdefault(bid, []).append(s)
+
+    async def _analyze_one_bet(bet_obj: Any) -> str:
+        """Generate analysis for one strategic bet. Returns empty string on failure."""
+        if isinstance(bet_obj, dict):
+            bet_str = bet_obj.get("bet", "")
+            bows = bet_obj.get("bows") or []
+            amount = bet_obj.get("amount_approx", "")
+        else:
+            bet_str = str(bet_obj)
+            bows = []
+            amount = ""
+        if not bet_str:
+            return ""
+
+        # Gather relevant scopes for this bet's BOWs
+        relevant: list[dict] = []
+        for bid in bows:
+            relevant.extend(bow_scope_map.get(bid, []))
+        if not relevant:
+            relevant = scope_outputs[:12]  # fallback when no BOW mapping
+
+        # Compact scope summaries for the prompt
+        scope_lines: list[str] = []
+        for s in relevant[:10]:
+            inv_ids = s.get("inv_ids") or [s.get("inv_id", "")]
+            inv_report = s.get("investment_report") or {}
+            facts = s.get("investment_facts") or {}
+            draft = s.get("section_draft") or {}
+            approved = float(facts.get("approved_amount", 0) or 0)
+            deviations = [
+                d.get("description", "")[:100]
+                for d in (draft.get("ranked_deviations") or [])[:3]
+            ]
+            line = (
+                f"  {', '.join(inv_ids)}"
+                f"  team={inv_report.get('team_execution_score', '?')}"
+                f"  ai_verdict={inv_report.get('overall_status', '?')}"
+                f"  divergence={inv_report.get('divergence_severity', '?')}"
+                f"  approved=${approved / 1e6:.1f}M"
+            )
+            if deviations:
+                line += "\n  deviations: " + "; ".join(deviations)
+            scope_lines.append(line)
+
+        prompt = (
+            f"Write the '{bet_str}' section of the Key Insights chapter "
+            "in a quarterly portfolio review report.\n\n"
+            f"**Strategic bet:** {bet_str}"
+            + (f"\nBundles of Work: {', '.join(bows)}" if bows else "")
+            + (f"\nApproximate exposure: {amount}" if amount else "")
+            + "\n\nRelevant investment findings:\n"
+            + ("\n\n".join(scope_lines) if scope_lines else "(no investment data)")
+            + "\n\nWrite 3-5 tight paragraphs structured as:\n"
+            "1. **Deviations review:** flag specific investments by ID. Cite dollar amounts, "
+            "timeline slips, milestone misses, and months at risk.\n"
+            "2. **Premises review:** assess whether the scientific/strategic premises of this "
+            "bet are supported. Note evidence gaps and contested assumptions.\n"
+            "3. **Patterns review:** cross-investment patterns (measurement gaps, partner "
+            "concentration, execution-lane risks, outputs-without-outcomes).\n"
+            "4. **Alignment verdict:** exactly one of **confirms** / **requires update** / "
+            "**invalidates** / **neutral** — one sentence of rationale. "
+            "Format as: 'Alignment verdict: requires update — <rationale>.'\n\n"
+            "Be specific. Cite investment IDs and dollar amounts. No hedging."
+        )
+
+        try:
+            text = await acall_llm(prompt, model=model, config=config)
+            if not isinstance(text, str) or not text.strip():
+                return ""
+            return f"### {bet_str[:120]}\n\n{_strip_leading_heading(text.strip())}\n"
+        except Exception as exc:
+            logger.warning("_build_key_insights bet '%s' failed: %s", bet_str[:40], exc)
+            return ""
+
+    # Run per-bet analyses in parallel (capped at 6 bets)
+    bet_results = await asyncio.gather(
+        *[_analyze_one_bet(b) for b in major_bets[:6]],
+        return_exceptions=True,
+    )
+    for result in bet_results:
+        if isinstance(result, str) and result.strip():
+            parts.append(result)
+
+    # ── Cross-bet patterns ─────────────────────────────────────────────────
+    patterns = cross_cutting.get("patterns") or []
+    if patterns:
+        parts.append("### Cross-bet patterns\n")
+        for p in patterns[:8]:
+            parts.append(f"- {p}")
+        parts.append("")
+
+    # ── Calibration paragraph ─────────────────────────────────────────────
+    contradictions = cross_cutting.get("contradictions") or []
+    if patterns or contradictions:
+        calib_prompt = (
+            "Write a 'Calibration' paragraph (3-5 sentences) for a portfolio review report. "
+            "Cover: (1) what the assessment is confident about and why, "
+            "(2) where significant uncertainty remains, "
+            "(3) what could not be determined from the available evidence.\n\n"
+            + ("Cross-cutting patterns:\n" + "\n".join(f"- {p}" for p in patterns[:5])
+               if patterns else "")
+            + ("\n\nContradictions:\n" + "\n".join(f"- {c}" for c in contradictions[:3])
+               if contradictions else "")
+        )
+        try:
+            calib_text = await acall_llm(calib_prompt, model=model, config=config)
+            if isinstance(calib_text, str) and calib_text.strip():
+                parts.append("### Calibration\n")
+                parts.append(_strip_leading_heading(calib_text.strip()))
+                parts.append("")
+        except Exception as exc:
+            logger.warning("_build_key_insights calibration failed: %s", exc)
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Main assembly function
 # ---------------------------------------------------------------------------
 
@@ -518,6 +842,8 @@ async def assemble_report(
     grade: str = "D",
     model: str = "",
     config: Any = None,
+    investment_scoring: dict | None = None,
+    program: str = "",
     # Kept for call-site backward compatibility; ignored — data is in cross_cutting_analysis
     clusters: list[dict] | None = None,
     orientation_summary: str = "",
@@ -534,10 +860,13 @@ async def assemble_report(
     sections: list[str] = []
 
     # ── 1. Title ─────────────────────────────────────────────────────────────
-    sections.append("# Portfolio Analysis Report\n")
+    report_title = f"# {program} — Portfolio Risk Assessment\n" if program else "# Portfolio Risk Assessment\n"
+    sections.append(report_title)
 
     # ── 2. Executive Summary (LLM) ────────────────────────────────────────────
-    exec_summary = await _build_executive_summary(cross_cutting, scope_outputs, model, config=config)
+    exec_summary = await _build_executive_summary(
+        cross_cutting, scope_outputs, model, config=config, program=program
+    )
     sections.append("## Executive Summary\n")
     sections.append(exec_summary)
     sections.append("")
@@ -546,13 +875,24 @@ async def assemble_report(
     sections.append(_build_portfolio_dashboard(scope_outputs, coverage_pct, grade, confidence_map))
     sections.append("")
 
-    # ── 3b. Team-vs-AI confusion matrix (optional, requires Pillow) ───────────
-    cm_snippet = _try_render_confusion_matrix(scope_outputs)
-    if cm_snippet:
-        sections.append(cm_snippet)
+    # ── 4. Scoring Comparison (divergence tables + confusion matrix + scatter) ──
+    # Mirrors old report_assembler.py ## Scoring Comparison section which lives
+    # in the focused PDF (before the ## Investment Analysis split marker).
+    scoring_comp = _build_scoring_comparison(scope_outputs, investment_scoring)
+    sections.append(scoring_comp)
+    sections.append("")
+
+    # ── 5. Key Insights (per-bet LLM narrative with alignment verdicts) ────────
+    # Mirrors old report_assembler.py ## Key Insights section — the analytical
+    # body of the focused PDF (Bet 1-N + cross-bet patterns + calibration).
+    key_insights = await _build_key_insights(
+        scope_outputs, cross_cutting, model, config=config
+    )
+    if key_insights:
+        sections.append(key_insights)
         sections.append("")
 
-    # ── 4. Body Sections (BOW routing) ────────────────────────────────────────
+    # ── 6. Body Sections (BOW routing) ────────────────────────────────────────
     single_bow_map, multi_bow_scopes = _route_scopes(scope_outputs)
 
     if single_bow_map:
@@ -566,7 +906,7 @@ async def assemble_report(
                 sections.append(_scope_body_section(scope))
             sections.append("")
 
-    # ── 5. Cross-Cutting Region ───────────────────────────────────────────────
+    # ── 7. Cross-Cutting Region ───────────────────────────────────────────────
     sections.append("## Cross-Cutting Analysis\n")
 
     essay = cross_cutting.get("essay", "")
@@ -612,12 +952,12 @@ async def assemble_report(
             sections.append(f"**{title}**{urgency_str}: {desc}")
             sections.append("")
 
-    # ── 6. Bibliography ───────────────────────────────────────────────────────
+    # ── 8. Bibliography ───────────────────────────────────────────────────────
     bib_text, bib_list = _build_bibliography(all_excerpts)
     sections.append(bib_text)
     sections.append("")
 
-    # ── 7. Appendices ─────────────────────────────────────────────────────────
+    # ── 9. Appendices ─────────────────────────────────────────────────────────
     sections.append(_build_appendices(scope_outputs, confidence_map, all_excerpts))
 
     # ── Table of Contents (inserted after title) ──────────────────────────────
@@ -637,8 +977,14 @@ async def assemble_report(
                 break
     toc_text = "\n".join(toc_lines) + "\n"
 
-    # Insert ToC after the title
-    full_body = full_body.replace("# Portfolio Analysis Report\n", "# Portfolio Analysis Report\n\n" + toc_text + "\n", 1)
+    # Insert ToC after the first H1 title (program name varies)
+    full_body = re.sub(
+        r"(^# .+\n)",
+        lambda m: m.group(1) + "\n" + toc_text + "\n",
+        full_body,
+        count=1,
+        flags=re.MULTILINE,
+    )
 
     return {
         "markdown": full_body,

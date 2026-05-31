@@ -1647,8 +1647,15 @@ async def assemble_report(state: AnalyzeState, config: RunnableConfig = None) ->
 
     # ── F-029: Retry loop — up to ASSEMBLY_MAX_RETRIES on structure validation failure ──
     def _validate_report_structure(md: str) -> bool:
-        """Check that the report has at least 4 required H2 sections."""
-        required = {"Executive Summary", "Portfolio Dashboard", "Cross-Cutting Analysis", "Bibliography"}
+        """Check that the report has the required H2 sections."""
+        required = {
+            "Executive Summary",
+            "Portfolio Dashboard",
+            "Scoring Comparison",
+            "Key Insights",
+            "Cross-Cutting Analysis",
+            "Bibliography",
+        }
         found = set(_re.findall(r"^## (.+)$", md, _re.MULTILINE))
         return bool(required & found) and len(md) > 500
 
@@ -1669,6 +1676,8 @@ async def assemble_report(state: AnalyzeState, config: RunnableConfig = None) ->
                 grade=state.get("grade") or "D",
                 model=state.get("synthesis_model", ""),
                 config=narration_config,
+                investment_scoring=state.get("investment_scoring") or {},
+                program=state.get("program") or "",
             )
             report_dict = report if isinstance(report, dict) else {"body": str(report)}
             final_report_md = report_dict.get("markdown", report_dict.get("body", ""))
